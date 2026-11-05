@@ -535,3 +535,82 @@ fenêtre) et fenêtre 4096 divergent tous deux de MTP à 3 tokens au caractère 
 de lots de vérification (arrondis flottants), pas de la fenêtre.
 
 Non fait : retenter MTP k=4 avec le KV libéré ; tailles de fenêtre autres que 4096.
+
+## 12. Optimisation round 2026-11-05 (F0-F6)
+
+But : le scénario agentique mixte (§10) à 600 t/s de prefill et 50 t/s de décodage par requête.
+Commits de `c13dabdccf` (F0) à `bd795fc077` (F6), branche `feat/gdn-step-cache`. Résultat : le prefill
+tient déjà la cible, le décodage reste à ~37 t/s, et les gains de noyaux n'apparaissent pas de bout en bout.
+
+### 12.1 Scénario et outils
+`agent_bench.py --mixed` : 3 agents décodent avec ~90k tokens de contexte chacun (MTP k=3, KV int4 par
+défaut), pendant qu'un prompt froid de 90 024 tokens arrive. Les décodeurs ignorent l'EOS et sont mesurés
+sur la fenêtre de prefill.
+
+Commandes (serveur lancé avec `bonsai launch --detach`, Python du venv) :
+- `python tools/agent_bench.py --url http://127.0.0.1:8000 --mixed --json results/NOM.json`
+- `python tools/quality.py --json results/NOM.json nll` (NLL sur un texte figé)
+- `python tools/quality.py --json results/NOM.json needle` (aiguille, 4 × 97k)
+- `python tools/quality.py greedy --save FICHIER`, puis `greedy --compare FICHIER`
+- `python tools/tgemm_isa.py` (rapport ISA statique des noyaux WMMA, sans GPU)
+- `python tools/step_profile.py TRACE` (profil torch : pas décodage ou mixte, GPU et CPU par catégorie)
+
+### 12.2 Résultats
+| Configuration | prefill (t/s) | décodage moyen (t/s) | Qualité | Fichier |
+|---|---|---|---|---|
+| Base (avant le tour) | 718 | 37 | greedy de référence, NLL 0,6995 | `base_mixed.json` |
+| F1 + F2, D = 55 ms | 334 | 44 | | `f1f2_d55_mixed.json` |
+| F1 + F2, D = 55 ms, graphes 512 | 264 | 46 (31 pour le 3ᵉ) | | `graphs512_d55_mixed.json` |
+| F5 lag, ratio 2 | 743 | 38,5 | needle 1/4 selon le commit (voir 12.5) | `lag2fixed_mixed.json` |
+| F1 + F6 (état par défaut) | 719 | 37 | greedy 1,000, NLL 0,6995, needle 4/4 | `f6_mixed.json` |
+
+- F1 (GEMM ternaire 16 < M ≤ 64) : somme des 4 GEMM d'une couche à M = 60, de 1,156 à 0,546 ms.
+  Bit-exact sur 40 cas.
+- F0 (noyau int4 de décodage) et F0b (outils) n'ont pas de mesure de débit propre. Pas de F3 ni F4.
+
+### 12.3 Diagnostic
+- Décodage seul (3 × 90k, graphes HIP) : 40,6 ms par pas. Le GEMV ternaire et l'attention int4 sont
+  chacun à ~500 Go/s.
+- Pas mixtes : ~151 ms par pas, dont ~131 ms de CPU et ~96 ms d'inactivité GPU. Le GDN ne tourne pas
+  dans les graphes (~56 ms de CPU), comme l'attention du morceau de prefill : le pas passe en mode
+  « piecewise » avec ces opérations en eager.
+- Conséquence : un GEMM plus rapide ne gagne presque rien tant que le CPU bloque le GPU.
+- Calcul de capacité : 3 décodeurs à 60 t/s prennent ≈ 0,8 s de GPU par seconde ; 600 t/s de prefill
+  prennent ≈ 0,45-0,55 s/s. Le total dépasse 1 s/s : il faut réduire le coût fixe par pas.
+
+### 12.4 Options ajoutées
+- `--decode-deadline-ms MS` (lanceur `bonsai launch`, transmis à vLLM) : limite le temps prédit d'un pas
+  quand des requêtes décodent. Défaut : désactivé.
+- `--sched-cost-model auto|a,b,c,d` (flag vLLM, non transmis par le lanceur) : `auto` ajuste le plafond
+  de prefill d'après la durée du pas précédent, borné par `--min-prefill-chunk` et le budget.
+  `a,b,c,d` donne un modèle linéaire statique.
+- `--kv-evict off|lag|kvzip` et `--kv-evict-ratio R` (> 1, défaut 2) : éviction « virtuelle ». Les blocs
+  restent alloués, seule une sélection est lue par les 16 couches d'attention. Env : `BONSAI_KV_EVICT`,
+  `BONSAI_KV_EVICT_RATIO`, `BONSAI_KV_EVICT_LAYER` (défaut 7), `BONSAI_KV_EVICT_DEBUG=1`. Le mode
+  `kvzip` n'est pas implémenté.
+- `BONSAI_TGEMM_MT=0` : revient à l'ancien GEMM `wmma_small`.
+
+État par défaut : F2 et F5 sont désactivés. F1 est actif (`BONSAI_TGEMM_MT` vaut 1 par défaut) et F6
+est actif (pas de flag).
+
+Verdict : la cible de prefill est tenue (719 à 743 t/s). Celle de décodage ne l'est pas (37 à 38,5 t/s).
+F2 à D = 55 ms monte le décodage à 44 t/s, mais fait tomber le prefill à 334 t/s. F5 gagne 3 % de prefill
+et 4 % de décodage, mais la needle tombe à 1/4 (voir 12.5). F1 et F6 ne changent pas la qualité
+(greedy 1,000, NLL identique) : ce sont des gains de noyau sans effet bout en bout.
+
+### 12.5 Pièges
+- vLLM est installé en copie dans `.venv/lib/python*/site-packages/vllm`, pas en éditable. Après une
+  modification de `vllm/`, copier les `.py` modifiés dans cette copie.
+- `ternary_kernels.hip` est régénéré à partir de `ternary_kernels.cu` par le build. Modifier le `.cu`.
+- Les blocs KV font 1840 tokens (modèle hybride, blocs de checkpoint GDN). C'est trop gros pour une
+  éviction sans requête.
+- `results/lag2_needle.json` (4/4) date d'avant la correction de F5, quand l'éviction ne
+  s'appliquait jamais (chaque couche d'attention est son propre groupe KV). Après la correction
+  (27/53 blocs gardés à 97k), la needle est à 1/4 : c'est le chiffre valable.
+
+### 12.6 Pistes suivantes (ordre)
+1. Graphe FULL pour les pas mixtes (GDN et attention int4 capturables), ou réduction du coût CPU du GDN.
+2. Attention de décodage parcimonieuse et sensible à la requête (type Quest), au niveau de sous-pages
+   de 64 tokens.
+3. Fusion des petits noyaux : ~1900 lancements par pas à ~4 µs, soit ~7,6 ms par pas.
+4. Noyau d'attention de prefill (58 TFLOPS effectifs aujourd'hui, §9.2).
