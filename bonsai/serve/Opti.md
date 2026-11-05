@@ -614,3 +614,19 @@ et 4 % de décodage, mais la needle tombe à 1/4 (voir 12.5). F1 et F6 ne change
    de 64 tokens.
 3. Fusion des petits noyaux : ~1900 lancements par pas à ~4 µs, soit ~7,6 ms par pas.
 4. Noyau d'attention de prefill (58 TFLOPS effectifs aujourd'hui, §9.2).
+
+### 12.7 Prefill partagé entre les requêtes (`--share-prefill`, par défaut)
+
+`bonsai launch` passe `--long-prefill-token-threshold 128` (= 512 tokens par pas / 4 requêtes) :
+chaque prompt avance d'au plus 128 tokens par pas, donc les 4 prefills partagent chaque pas et
+chaque lecture des poids (Sarathi 2308.16369, Dynamic SplitFuse 2401.08671).
+`--no-share-prefill` revient au traitement un par un (premier arrivé, premier servi).
+
+| 4 prompts froids de ~99k envoyés ensemble | un par un | partagé |
+|---|---|---|
+| Prefill par requête | 1052 / 529 / 350 / 264 t/s | 290 t/s chacune |
+| Premier token | 95 / 187 / 282 / 375 s (moy. 235) | ~341 s pour toutes |
+| Débit total de prefill | ~1056 t/s | ~1161 t/s (+10 %) |
+| Décodage ensuite | 20,7 à 106 t/s | 54 à 81 t/s (moy. 71,5) |
+
+Résultats : `results/four_x_99k.json` (un par un), `results/four_x_99k_lpt128.json` (partagé).

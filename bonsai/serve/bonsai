@@ -85,6 +85,8 @@ INT4_MAX_CONTEXT = 100000
 INT4_BLOCK_TOKENS = 1840
 INT4_BLOCK_BYTES = 17 * INT4_BLOCK_TOKENS * 928
 GPU_MEMORY = 0.95
+# --share-prefill: concurrent prompts each get this many prompt tokens per step (max-num-batched-tokens // max-num-seqs).
+SHARE_PREFILL_BATCH_TOKENS = 512
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
@@ -234,6 +236,16 @@ def server_env(a) -> dict[str, str]:
     return env
 
 
+def share_prefill_args(a) -> list[str]:
+    """The long-prefill threshold for --share-prefill; empty when off or when the user sets one."""
+    flag = "--long-prefill-token-threshold"
+    if not a.share_prefill or a.prefill_chunk:
+        return []
+    if any(arg == flag or arg.startswith(flag + "=") for arg in a.vllm_args or []):
+        return []
+    return [flag, str(SHARE_PREFILL_BATCH_TOKENS // a.max_seqs)]
+
+
 def server_cmd(a, ctx: int, key: str | None) -> list[str]:
     model = str(MTP_GGUF) if a.draft == "mtp" else MODEL
     cmd = [str(VLLM), "serve", model, "--tokenizer", TOKENIZER, "--served-model-name", "bonsai",
@@ -257,7 +269,7 @@ def server_cmd(a, ctx: int, key: str | None) -> list[str]:
         cmd += ["--kv-cache-dtype", "fp8"]
     elif a.kv == "int4":
         cmd += ["--kv-cache-dtype", "int4_per_token_head", "--mamba-ssm-cache-dtype", "bfloat16",
-                "--max-num-batched-tokens", "512"]
+                "--max-num-batched-tokens", str(SHARE_PREFILL_BATCH_TOKENS)]
     if a.draft == "dflash":
         cmd += ["--async-scheduling", "--speculative-config",
                 json.dumps({"method": "dflash", "model": str(DFLASH_DRAFT), "num_speculative_tokens": 7,
@@ -266,6 +278,7 @@ def server_cmd(a, ctx: int, key: str | None) -> list[str]:
         cmd += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": a.spec_tokens})]
     if a.prefill_chunk:
         cmd += ["--long-prefill-token-threshold", str(a.prefill_chunk)]
+    cmd += share_prefill_args(a)
     if a.decode_deadline_ms is not None:
         cmd += ["--decode-deadline-ms", str(a.decode_deadline_ms)]
     if a.no_async:
@@ -419,6 +432,11 @@ def main() -> int:
     l.add_argument("--prefill-chunk", type=int, default=None, metavar="T",
                    help="while other requests run, prefill at most T prompt tokens per step (mixed into their decode "
                         "steps; vLLM --long-prefill-token-threshold). Default: off")
+    l.add_argument("--share-prefill", action=argparse.BooleanOptionalAction, default=True,
+                   help="concurrent prompts prefill together, each at most 128 tokens per step (max-num-batched-tokens / "
+                        "max-num-seqs; vLLM --long-prefill-token-threshold). Measured 4 x 99k cold prompts: each 290 t/s, "
+                        "all first tokens at ~341 s (one by one: 95/187/282/375 s), total prefill +10%%, then 4 decoders "
+                        "at ~71 t/s. Default on; --no-share-prefill turns it off")
     l.add_argument("--mtp-window", type=int, default=4096, metavar="N",
                    help="MTP head attends only the last N tokens (lossless; --kv int4 + --draft mtp; default 4096, 0 = off)")
     l.add_argument("--decode-deadline-ms", type=parse_positive_ms, default=None, metavar="MS",
