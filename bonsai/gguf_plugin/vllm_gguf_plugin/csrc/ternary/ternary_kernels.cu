@@ -1009,7 +1009,15 @@ void launch_wmma_gemm(cudaStream_t stream, const Tensor& Q, const Tensor& S,
         (int*)counters.data_ptr(), M, N, K, splits);
     return;
   }
-  if (M <= 64) {
+  // 16 < M <= 64: the LDS-staged prefill kernel with one wave column of
+  // ceil(M/16) M-tiles beats wmma_small ~2x; BONSAI_TGEMM_MT=0 restores
+  // wmma_small for A/B.
+  static const bool small_mt = [] {
+    const char* v = std::getenv("BONSAI_TGEMM_MT");
+    return v && std::atoi(v) == 0;
+  }();
+  const bool tiled_small = !small_mt && M > 16 && M <= 64;
+  if (M <= 64 && !tiled_small) {
     static const int variant = [] {
       const char* v = std::getenv("TERNARY_WMMA_SMALL");
       return v ? std::atoi(v) : 0;
@@ -1049,14 +1057,29 @@ void launch_wmma_gemm(cudaStream_t stream, const Tensor& Q, const Tensor& S,
       default: run(I4{}, I1{}, I1{}); break;
     }
   } else {
-    constexpr int kWavesM = 2, kWavesN = 4, kTilesM = 4, kTilesN = 2;
-    constexpr int kBM = kWavesM * kTilesM * 16, kBN = kWavesN * kTilesN * 16;
-    const dim3 grid(((M + kBM - 1) / kBM) * ((N + kBN - 1) / kBN));
-    wmma_gemm_kernel<scalar_t, kWavesM, kWavesN, kTilesM, kTilesN>
-        <<<grid, 32 * kWavesM * kWavesN, 0, stream>>>(
-            (const uint8_t*)Q.data_ptr(), (const half*)S.data_ptr(),
-            (const int8_t*)xq.data_ptr(), (const float*)xs.data_ptr(),
-            (scalar_t*)Y.data_ptr(), M, N, K);
+    const auto run = [&](auto wm_c, auto wn_c, auto tm_c, auto tn_c) {
+      constexpr int WMS = decltype(wm_c)::value, WNS = decltype(wn_c)::value;
+      constexpr int TMS = decltype(tm_c)::value, TNS = decltype(tn_c)::value;
+      constexpr int kBM = WMS * TMS * 16, kBN = WNS * TNS * 16;
+      const dim3 grid(((M + kBM - 1) / kBM) * ((N + kBN - 1) / kBN));
+      wmma_gemm_kernel<scalar_t, WMS, WNS, TMS, TNS>
+          <<<grid, 32 * WMS * WNS, 0, stream>>>(
+              (const uint8_t*)Q.data_ptr(), (const half*)S.data_ptr(),
+              (const int8_t*)xq.data_ptr(), (const float*)xs.data_ptr(),
+              (scalar_t*)Y.data_ptr(), M, N, K);
+    };
+    using I1 = std::integral_constant<int, 1>;
+    using I2 = std::integral_constant<int, 2>;
+    using I4 = std::integral_constant<int, 4>;
+    if (M > 64) {
+      run(I2{}, I4{}, I4{}, I2{});
+    } else if (M <= 32) {
+      run(I1{}, I4{}, I2{}, I1{});
+    } else if (M <= 48) {
+      run(I1{}, I4{}, std::integral_constant<int, 3>{}, I1{});
+    } else {
+      run(I1{}, I4{}, I4{}, I1{});
+    }
   }
 }
 
