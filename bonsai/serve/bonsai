@@ -27,6 +27,9 @@ Other options (all of them: bonsai launch --help):
     --draft mtp|dflash|none   speculative decoding: MTP (default, 150k), DFlash2 (fastest, 63k), none (200k)
     --vision                  accept images, up to 8 per request, scaled down to 4 MP at most. The vision encoder takes
                               ~0.9 GiB of VRAM, so the fp8 context ceilings drop: mtp 114,688, none 163,840, dflash 40,960
+    --decode-deadline-ms MS   cap the predicted time of each step at MS ms, so prefill never stalls decodes (default off)
+    --kv-evict off|lag|kvzip  KV cache eviction, passed as BONSAI_KV_EVICT (default off); --kv-evict-ratio R (> 1, default 2)
+                              goes to BONSAI_KV_EVICT_RATIO
     --host ADDR, --port N, --api-key-env NAME, --no-api-key
 
 Everything it writes (the log, the pid, the key) goes to ~/.bonsai (or $BONSAI_HOME).
@@ -185,6 +188,25 @@ def api_key(a, data: Path, create: bool) -> str | None:
     return key
 
 
+PLAN_ENV = ("GPU_MAX_HW_QUEUES", "VLLM_GGUF_DRAFT_VOCAB_ON_CPU", "BONSAI_KV_EVICT", "BONSAI_KV_EVICT_RATIO")
+
+
+def parse_above_one(text: str) -> float:
+    """argparse type: a finite float greater than 1."""
+    value = float(text)
+    if not 1 < value < float("inf"):
+        raise argparse.ArgumentTypeError(f"must be a number above 1, not {text!r}")
+    return value
+
+
+def parse_positive_ms(text: str) -> float:
+    """argparse type: a finite float greater than 0."""
+    value = float(text)
+    if not 0 < value < float("inf"):
+        raise argparse.ArgumentTypeError(f"must be a positive number of milliseconds, not {text!r}")
+    return value
+
+
 def lan_addresses() -> list[str]:
     try:
         out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5).stdout.split()
@@ -206,6 +228,9 @@ def server_env(a) -> dict[str, str]:
         env["BONSAI_MTP_W8"] = "1"              # MTP head: rotated int8 + small-batch WMMA kernel (bonsai_mtp_w8.py)
         # own torch.compile cache: the plugin patches change the graphs but not vLLM's cache key
         env.setdefault("VLLM_CACHE_ROOT", str(HOME / ".cache" / "vllm-bonsai-int4"))
+    if a.kv_evict != "off":
+        env["BONSAI_KV_EVICT"] = a.kv_evict
+        env["BONSAI_KV_EVICT_RATIO"] = str(a.kv_evict_ratio)
     return env
 
 
@@ -241,6 +266,8 @@ def server_cmd(a, ctx: int, key: str | None) -> list[str]:
         cmd += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": a.spec_tokens})]
     if a.prefill_chunk:
         cmd += ["--long-prefill-token-threshold", str(a.prefill_chunk)]
+    if a.decode_deadline_ms is not None:
+        cmd += ["--decode-deadline-ms", str(a.decode_deadline_ms)]
     if a.no_async:
         cmd += ["--no-async-scheduling"]
     cmd += a.vllm_args or []
@@ -347,7 +374,7 @@ def cmd_launch(a) -> int:
     say("API key   " + ("from $" + a.api_key_env if a.api_key_env else f"yes ({data / 'api_key'})" if needs_key else "none"))
     if a.plan:
         env = server_env(a)
-        say("\nenv       GPU_MAX_HW_QUEUES=1" + ("  VLLM_GGUF_DRAFT_VOCAB_ON_CPU=1" if "VLLM_GGUF_DRAFT_VOCAB_ON_CPU" in env else ""))
+        say("\nenv       " + "  ".join(f"{k}={env[k]}" for k in PLAN_ENV if k in env))
         say("command   " + " ".join(c if " " not in c and "{" not in c else repr(c) for c in cmd).replace(key or "\0", "<key>"))
         return 0
     data.mkdir(parents=True, exist_ok=True)
@@ -394,6 +421,12 @@ def main() -> int:
                         "steps; vLLM --long-prefill-token-threshold). Default: off")
     l.add_argument("--mtp-window", type=int, default=4096, metavar="N",
                    help="MTP head attends only the last N tokens (lossless; --kv int4 + --draft mtp; default 4096, 0 = off)")
+    l.add_argument("--decode-deadline-ms", type=parse_positive_ms, default=None, metavar="MS",
+                   help="cap the predicted time of each step at MS milliseconds (vLLM --decode-deadline-ms; default off)")
+    l.add_argument("--kv-evict", choices=("off", "lag", "kvzip"), default="off",
+                   help="KV cache eviction mode, passed as BONSAI_KV_EVICT (default off)")
+    l.add_argument("--kv-evict-ratio", type=parse_above_one, default=2.0, metavar="R",
+                   help="KV eviction ratio, above 1, passed as BONSAI_KV_EVICT_RATIO (default 2; used only with --kv-evict)")
     l.add_argument("--spec-tokens", type=int, default=3, metavar="K", help="MTP draft tokens per step (default 3)")
     l.add_argument("--vllm-arg", dest="vllm_args", action="append", metavar="ARG",
                    help="extra argument passed to vllm serve (repeatable)")

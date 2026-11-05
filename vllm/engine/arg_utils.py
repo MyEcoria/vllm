@@ -714,6 +714,9 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    decode_deadline_ms: float | None = SchedulerConfig.decode_deadline_ms
+    sched_cost_model: str = SchedulerConfig.sched_cost_model
+    min_prefill_chunk: int = SchedulerConfig.min_prefill_chunk
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1808,6 +1811,18 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--decode-deadline-ms",
+            **scheduler_kwargs["decode_deadline_ms"],
+        )
+        scheduler_group.add_argument(
+            "--sched-cost-model",
+            **scheduler_kwargs["sched_cost_model"],
+        )
+        scheduler_group.add_argument(
+            "--min-prefill-chunk",
+            **scheduler_kwargs["min_prefill_chunk"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2682,6 +2697,9 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            decode_deadline_ms=self.decode_deadline_ms,
+            sched_cost_model=self.sched_cost_model,
+            min_prefill_chunk=self.min_prefill_chunk,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

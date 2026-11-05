@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
@@ -19,6 +20,25 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+
+
+DEFAULT_COST_MODEL = (30.0, 1.0, 0.95, 0.5)
+
+
+def parse_cost_model(value: str) -> tuple[float, float, float, float] | None:
+    """Parse an `a,b,c,d` cost model into 4 floats; "auto" gives None."""
+    if value == "auto":
+        return None
+    parts = value.split(",")
+    if len(parts) != 4:
+        raise ValueError(f"sched_cost_model needs 4 comma-separated floats: {value!r}")
+    try:
+        a, b, c, d = (float(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"sched_cost_model has a non-float value: {value!r}") from e
+    if not all(math.isfinite(x) for x in (a, b, c, d)):
+        raise ValueError(f"sched_cost_model values must be finite: {value!r}")
+    return a, b, c, d
 
 
 @config
@@ -208,6 +228,25 @@ class SchedulerConfig:
     already-admitted prompt, so a long prompt can take up to N times as many
     steps to finish prefilling."""
 
+    decode_deadline_ms: float | None = Field(default=None, gt=0)
+    """Opt-in decode-deadline token budget (Sarathi-Serve style). When set and
+    at least one running request is decoding, the prefill tokens added to a
+    step are capped so the predicted step time stays <= this many ms, using
+    the linear model of `sched_cost_model`. Replaces `prefill_schedule_interval`
+    logic when set. None (the default) keeps the current behaviour."""
+
+    sched_cost_model: str = "auto"
+    """"auto" (default) adapts the prefill cap from the measured duration of
+    the previous step (cap *= clamp(deadline / t_prev, 0.5, 1.25)). Otherwise
+    comma-separated `a,b,c,d` of the static step cost model
+    t_ms = a + b*decode_tokens + c*prefill_tokens
+    + d*prefill_tokens*prefill_ctx_len/1e5. Only used with
+    `decode_deadline_ms`."""
+
+    min_prefill_chunk: int = Field(default=16, ge=1)
+    """Minimum prefill tokens granted per step in deadline mode, so prefill
+    never starves."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -285,6 +324,13 @@ class SchedulerConfig:
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
+
+    @field_validator("sched_cost_model")
+    @classmethod
+    def _validate_sched_cost_model(cls, value: str) -> str:
+        """Check that the cost model is four comma-separated floats."""
+        parse_cost_model(value)
+        return value
 
     @field_validator("scheduler_cls", "async_scheduling", mode="wrap")
     @classmethod
