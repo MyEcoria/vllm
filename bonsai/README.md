@@ -35,15 +35,17 @@ The server listens on port 8000. The API key is read from `~/.bonsai/api_key`.
 
 ## Benchmarks
 
-Both tools take `--url` (default `$BONSAI_URL`, else `http://127.0.0.1:8000`). The API key comes from `BONSAI_API_KEY`, else `~/.bonsai/api_key`.
+All tools take `--url` (default `$BONSAI_URL`, else `http://127.0.0.1:8000`). The API key comes from `BONSAI_API_KEY`, else `~/.bonsai/api_key`.
 
 ```bash
 .venv/bin/python bonsai/serve/tools/serve_bench.py --url http://127.0.0.1:8000
 .venv/bin/python bonsai/serve/tools/longctx.py --url http://127.0.0.1:8000
+.venv/bin/python bonsai/serve/tools/agent_bench.py --url http://127.0.0.1:8000 --sync-turns
 ```
 
 - `serve_bench.py` prints one `SERVE` line: prefill speed (pp512, tokens/s, with TTFT) and decode speed (tg, tokens/s).
 - `longctx.py` sends one long prompt (`LONGWORDS` words, default 55000) with a hidden number and prints a `LONG` line with the token count, time, and whether the number was found.
+- `agent_bench.py` runs 4 agents with distinct growing histories (90k start tokens, +2-4k per turn, 256 output tokens, `--max-context` 100000). It prints one line per request with cached and prompt tokens, prefill and decode speeds, then a per-turn summary. `--sync-turns` makes all agents start each turn together. Needs the server flag `--enable-prompt-tokens-details`.
 
 ## Tests
 

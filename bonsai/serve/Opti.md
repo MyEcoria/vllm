@@ -482,3 +482,28 @@ M=60). Ni le trafic d'activations, ni leur latence, ni la forme des tuiles n'exp
 WMMA) ; sans compteurs matériels (rocprofv3-avail ne fonctionne pas ici), la cause reste à trouver.
 Compteurs matériels : `rocprofv3 --pmc` échoue (« aqlprofile API table load failed », puis SIGFPE avec la version
 du venv strata). Probablement des droits (root) ou gfx1201 non pris en charge par cette version d'aqlprofile.
+
+## 10. Charge agentique (F1)
+
+Outil : `serve/tools/agent_bench.py`. 4 agents aux historiques distincts, départ à 90k tokens, +2-4k tokens par tour,
+256 tokens de sortie, `--sync-turns` (barrière : tous les agents démarrent le tour N ensemble), `--max-context 100000`.
+Il affiche pour chaque requête les tokens `cached/prompt` (nécessite le flag serveur `--enable-prompt-tokens-details`,
+désormais dans le lanceur).
+
+### 10.1 Référence (sans synchronisation)
+- Tour 1 (froid, 4 × 90k) : prefill moyen 564 t/s, décodage 15 t/s, TTFT 206 s.
+- Tours suivants (chauds) : delta prefill 91-360 t/s, décodage moyen 15-53 t/s, minimum 9-21 t/s.
+- Taux de hit du cache global : 72 % (tour froid inclus).
+
+### 10.2 Diagnostic
+- Hit du préfixe sur les tours chauds : 94-97 % par requête (cache de préfixes et mode d'alignement Mamba
+  fonctionnent avec MTP, RecoverSSM et int4).
+- Tokens recalculés en plus par tour : 0-1840 (bloc de checkpoint GDN de 1840) + la réponse précédente (~256).
+- Pas d'éviction (pool de 400k tokens).
+- TTFT restant de 6-27 s : file d'attente. ~13k nouveaux tokens par tour pour 4 agents, préfillés pendant que
+  les autres décodent (intervalle de prefill 6).
+
+### 10.3 Conclusion
+Le décodage seul fait ~58-62 t/s à 100k : il n'y a pas de marge. Tout prefill concurrent fait passer le décodage
+sous 60 t/s. Suite : accélérer le décodage (F3 Windowed-MTP, F4 noyaux d'attention HIP), puis F2 (découpage du
+prefill selon une échéance) pour partager la marge.

@@ -220,6 +220,7 @@ def server_cmd(a, ctx: int, key: str | None) -> list[str]:
              if a.vision else []),
            "--attention-backend", "TRITON_ATTN",
            "--reasoning-parser", "qwen3",
+           "--enable-prompt-tokens-details",   # usage.prompt_tokens_details.cached_tokens (cache diagnosis)
            "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
            # Measured 2026-11-04 (2 requests, 25k-token prompts): with the default (1), each decode step of a running
            # request waits for a 2048-token prefill chunk (~1.2 s), so it drops to ~13 t/s; with 32 it keeps ~42 t/s,
