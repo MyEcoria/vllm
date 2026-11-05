@@ -55,3 +55,42 @@ def test_window_min_rate():
     times = [i * 0.1 for i in range(31)]
     assert abs(ab.window_min_rate(times, 31) - 10.0) < 1.0
     assert ab.window_min_rate([0.0, 0.5], 2) is None
+
+
+def test_window_stats_mean_and_worst_bucket():
+    times = [0.1, 0.2, 0.3, 0.4, 1.5, 2.5, 2.6]
+    mean, worst = ab.window_stats(times, 0.0, 3.0)
+    assert mean == 7 / 3 and worst == 1.0
+
+
+def test_window_stats_excludes_outside_and_short_window():
+    mean, worst = ab.window_stats([0.0, 0.1, 0.2, 5.0], 0.1, 0.6)
+    assert mean == 2 / 0.5 and worst == 2 / 0.5
+    assert ab.window_stats([1.0], 2.0, 2.0) == (0.0, 0.0)
+
+
+def test_summarize_mixed_and_verdict():
+    dec = [[i * 0.01 for i in range(300)], [i * 0.1 for i in range(30)]]
+    s = ab.summarize_mixed(99000, 100.0, 0.0, 3.0, dec)
+    assert s["prefill_tps"] == 990.0
+    assert s["decoders"][0]["mean"] == 100.0 and s["decoders"][1]["worst"] == 10.0
+    assert not ab.mixed_verdict(s, 600, 60)
+    assert ab.mixed_verdict(s, 600, 10)
+    assert "prefill 990" in ab.format_mixed(s)
+
+
+def test_mtp_chunks_weighted_by_cumulative_usage():
+    assert ab.chunk_weights([3, 4, 8]) == ([3, 1, 4], True)
+    assert ab.chunk_weights([3, None]) == ([1, 1], False)
+    mean, worst = ab.window_stats([0.5, 1.5], 0.0, 2.0, [3, 1])
+    assert mean == 2.0 and worst == 1.0
+
+
+def test_uncached_prefill_used_by_check():
+    dec = [[0.1, 0.2]] * 3
+    s = ab.summarize_mixed(1000, 2.0, 0.0, 1.0, dec, [[2, 4]] * 3, cached=800)
+    assert s["prefill_tps"] == 500 and s["uncached_prefill_tps"] == 100
+    assert s["decoders"][0]["mean"] == 4 and "uncached 100" in ab.format_mixed(s)
+    assert not ab.mixed_verdict(s, 200, 1)
+    fb = ab.summarize_mixed(1000, 2.0, 0.0, 1.0, dec)
+    assert not fb["exact_tokens"] and "no usage" in ab.format_mixed(fb)

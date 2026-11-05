@@ -1,5 +1,6 @@
 """Simulate N independent agents with long, growing contexts against a Bonsai server."""
 import argparse
+import copy
 import json
 import os
 import random
@@ -56,6 +57,17 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--model", default="bonsai")
     p.add_argument("--json", dest="json_path", default=None)
+    p.add_argument("--mixed", action="store_true",
+                   help="3 warm decoders + a 4th prefill arriving mid-decode")
+    p.add_argument("--mixed-delta", type=int, default=None, metavar="N",
+                   help="4th request is a warm agent sending only N new tokens")
+    p.add_argument("--mixed-tokens", type=int, default=99000,
+                   help="context size of the warm agents and the cold 4th prompt")
+    p.add_argument("--mixed-max-tokens", type=int, default=1500)
+    p.add_argument("--check", action="store_true",
+                   help="--mixed: exit 1 if below the thresholds")
+    p.add_argument("--min-prefill", type=float, default=TARGET_PREFILL)
+    p.add_argument("--min-decode", type=float, default=TARGET_DECODE)
     return p.parse_args(argv)
 
 
@@ -130,11 +142,12 @@ def window_min_rate(times, generated, window=1.0):
     return min(rates)
 
 
-def stream_request(args, headers, prompt):
+def stream_request(args, headers, prompt, on_first=None, counts=None):
     """Stream one completion; return text, chunk times, usage and t0."""
     payload = {"model": args.model, "prompt": prompt, "max_tokens": args.max_tokens,
                "temperature": 0, "ignore_eos": True, "stream": True,
-               "stream_options": {"include_usage": True}}
+               "stream_options": {"include_usage": True,
+                              "continuous_usage_stats": True}}
     req = urllib.request.Request(args.url + "/v1/completions",
                                  json.dumps(payload).encode(), headers)
     text, times, usage, t0 = [], [], None, time.perf_counter()
@@ -148,6 +161,10 @@ def stream_request(args, headers, prompt):
             if chunk:
                 text.append(chunk)
                 times.append(time.perf_counter())
+                if counts is not None:
+                    counts.append((obj.get("usage") or {}).get("completion_tokens"))
+                if len(times) == 1 and on_first:
+                    on_first()
     return "".join(text), times, usage, t0
 
 
@@ -285,10 +302,148 @@ def print_summary(rows):
           f"{TARGET_DECODE:.0f} t/s -> {verdict(rows) or 'N/A (need >=2 turns)'}")
 
 
+def chunk_weights(cumulative):
+    """Return (tokens per chunk, exact) from cumulative counts; 1/chunk if absent."""
+    if not cumulative or any(c is None for c in cumulative):
+        return [1] * len(cumulative or []), False
+    return [c - p for p, c in zip([0] + cumulative, cumulative)], True
+
+
+def window_stats(times, start, end, weights=None):
+    """Return (mean, worst 1-s bucket) tokens/s of arrivals inside [start, end)."""
+    if end <= start:
+        return 0.0, 0.0
+    weights = weights or [1] * len(times)
+    n_buckets = max(1, int((end - start) // 1.0))
+    width = min(1.0, end - start)
+    counts = [0] * n_buckets
+    for t, w in zip(times, weights):
+        if start <= t < end:
+            counts[min(n_buckets - 1, int((t - start) // width))] += w
+    return sum(counts) / (end - start), min(counts) / width
+
+
+def mixed_verdict(summary, min_prefill, min_decode):
+    """Return True if prefill (uncached if known) and every decoder mean pass."""
+    prefill = summary.get("uncached_prefill_tps")
+    if prefill is None:
+        prefill = summary["prefill_tps"]
+    return prefill >= min_prefill and all(
+        d["mean"] >= min_decode for d in summary["decoders"])
+
+
+def summarize_mixed(prompt_tokens, ttft, start, end, decoder_times,
+                    decoder_counts=None, cached=None):
+    """Build the mixed-run summary dict from timestamps and cumulative counts."""
+    decoders, exact = [], True
+    for i, times in enumerate(decoder_times):
+        w, ok = chunk_weights((decoder_counts or [None] * len(decoder_times))[i] or [])
+        exact = exact and ok
+        mean, worst = window_stats(times, start, end, w if ok else None)
+        decoders.append({"mean": mean, "worst": worst})
+    rate = lambda n: n / ttft if ttft > 0 else 0.0
+    return {"prompt_tokens": prompt_tokens, "ttft": ttft, "window": end - start,
+            "prefill_tps": rate(prompt_tokens), "cached_tokens": cached,
+            "uncached_prefill_tps": None if cached is None
+            else rate(prompt_tokens - cached),
+            "exact_tokens": exact, "decoders": decoders}
+
+
+def format_mixed(s):
+    """Format the one-line mixed summary."""
+    dec = " ".join(f"d{i} {d['mean']:.1f}/{d['worst']:.1f}"
+                   for i, d in enumerate(s["decoders"]))
+    unc = s.get("uncached_prefill_tps")
+    unc = "" if unc is None else f", uncached {unc:.0f} t/s"
+    note = "" if s.get("exact_tokens", True) else " [tokens=chunks: no usage]"
+    return (f"mixed: prefill {s['prefill_tps']:.0f} t/s{unc} (prompt "
+            f"{s['prompt_tokens']} ttft {s['ttft']:.2f}s) decoders mean/worst1s "
+            f"t/s: {dec}{note}")
+
+
+def start_decoders(args, headers, prompts, errors):
+    """Start one thread per warm prompt; return threads, times, counts, events."""
+    cfg = copy.copy(args)
+    cfg.max_tokens = args.mixed_max_tokens
+    events = [threading.Event() for _ in prompts]
+    times = [[] for _ in prompts]
+    counts = [[] for _ in prompts]
+
+    def work(i):
+        """Stream one warm decoder and store its chunk times."""
+        try:
+            times[i] = stream_request(cfg, headers, prompts[i], events[i].set,
+                                    counts[i])[1]
+        except Exception as exc:
+            errors.append(f"decoder {i}: {exc!r}")
+            events[i].set()
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(len(prompts))]
+    for t in threads:
+        t.start()
+    return threads, times, counts, events
+
+
+def fourth_prompt(args, headers, rng, warm_prompt_fn):
+    """Return the 4th prompt: cold, or a cached prefix plus an N-token delta."""
+    if args.mixed_delta is None:
+        return make_text(rng, args, headers, args.mixed_tokens, "# a3 ")
+    prefix = warm_prompt_fn()
+    cfg = copy.copy(args)
+    cfg.max_tokens = 1
+    stream_request(cfg, headers, prefix)
+    return prefix + make_text(rng, args, headers, args.mixed_delta, "[tool] ")
+
+
+def run_mixed(args, headers):
+    """Run the mixed scenario; return (summary or None, errors)."""
+    rng = random.Random(args.seed)
+    prompts = [make_text(random.Random(args.seed * 1000 + i), args, headers,
+                         args.mixed_tokens, f"# a{i} ") for i in range(3)]
+    prefix_fn = lambda: make_text(random.Random(args.seed * 1000 + 3), args,
+                                  headers, args.mixed_tokens, "# a3 ")
+    last = fourth_prompt(args, headers, rng, prefix_fn)
+    errors = []
+    threads, times, counts, events = start_decoders(args, headers, prompts, errors)
+    for e in events:
+        e.wait()
+    cfg = copy.copy(args)
+    cfg.max_tokens = 16
+    summary = None
+    try:
+        _, t4, usage, start = stream_request(cfg, headers, last)
+        usage = usage or {}
+        tokens = usage.get("prompt_tokens", len(last) // 4)
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        for t in threads:
+            t.join()
+        summary = summarize_mixed(tokens, t4[0] - start, start, t4[0], times,
+                                  counts, cached)
+    except Exception as exc:
+        errors.append(f"4th request: {exc!r}")
+    return summary, errors
+
+
+def main_mixed(args, headers):
+    """Run the mixed mode, print the summary line, write JSON, return exit code."""
+    summary, errors = run_mixed(args, headers)
+    for e in errors:
+        print("ERROR", e, file=sys.stderr)
+    if summary is None:
+        return 1
+    print(format_mixed(summary))
+    if args.json_path:
+        Path(args.json_path).write_text(json.dumps(summary, indent=1))
+    ok = mixed_verdict(summary, args.min_prefill, args.min_decode)
+    return 1 if args.check and not ok else 0
+
+
 def main(argv=None):
     """Run all agents concurrently, then print rows, summary and cache hit rate."""
     args = parse_args(argv)
     headers = build_headers()
+    if args.mixed:
+        return main_mixed(args, headers)
     before = scrape(args, headers)
     results, errors, threads = [], [], []
     barrier = threading.Barrier(args.agents) if args.sync_turns else None
