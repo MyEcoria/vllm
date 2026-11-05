@@ -202,6 +202,7 @@ def server_env(a) -> dict[str, str]:
         env["BONSAI_INT4_ATTN"] = "1"           # HIP attention + K4/V3 cache (plugin bonsai_int4_attn.py)
         env["BONSAI_GDN_RECOVERSSM"] = "1"      # one GDN state per request instead of 1 + k (bonsai_gdn_recoverssm.py)
         env["VLLM_USE_V2_MODEL_RUNNER"] = "1"   # RecoverSSM with prefix caching needs Model Runner V2
+        env["BONSAI_MTP_WINDOW"] = str(a.mtp_window)   # draft-only sliding window (bonsai_mtp_window.py), 0 = off
         env["BONSAI_MTP_W8"] = "1"              # MTP head: rotated int8 + small-batch WMMA kernel (bonsai_mtp_w8.py)
         # own torch.compile cache: the plugin patches change the graphs but not vLLM's cache key
         env.setdefault("VLLM_CACHE_ROOT", str(HOME / ".cache" / "vllm-bonsai-int4"))
@@ -391,6 +392,8 @@ def main() -> int:
     l.add_argument("--prefill-chunk", type=int, default=None, metavar="T",
                    help="while other requests run, prefill at most T prompt tokens per step (mixed into their decode "
                         "steps; vLLM --long-prefill-token-threshold). Default: off")
+    l.add_argument("--mtp-window", type=int, default=4096, metavar="N",
+                   help="MTP head attends only the last N tokens (lossless; --kv int4 + --draft mtp; default 4096, 0 = off)")
     l.add_argument("--spec-tokens", type=int, default=3, metavar="K", help="MTP draft tokens per step (default 3)")
     l.add_argument("--vllm-arg", dest="vllm_args", action="append", metavar="ARG",
                    help="extra argument passed to vllm serve (repeatable)")

@@ -226,6 +226,10 @@ def register() -> None:
         from .bonsai_mtp_w8 import patch as _patch_mtp_w8
 
         _patch_mtp_w8()
+    if os.environ.get("BONSAI_MTP_WINDOW", "0") != "0":
+        from .bonsai_mtp_window import patch as _patch_mtp_window
+
+        _patch_mtp_window()
     if os.environ.get("BONSAI_GDN_RECOVERSSM") == "1":
         from .bonsai_gdn_recoverssm import patch as _patch_gdn_recoverssm
 

@@ -59,7 +59,7 @@ Expected result: 104 passed.
 
 - F1: agent benchmark and hybrid prefix cache.
 - F2: adaptive prefill chunking.
-- F3: Windowed-MTP.
+- F3: Windowed-MTP (done, on by default: `--mtp-window 4096`).
 - F4: HIP attention kernels.
 - F5: optional sparse decode attention.
 

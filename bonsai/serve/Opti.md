@@ -507,3 +507,31 @@ désormais dans le lanceur).
 Le décodage seul fait ~58-62 t/s à 100k : il n'y a pas de marge. Tout prefill concurrent fait passer le décodage
 sous 60 t/s. Suite : accélérer le décodage (F3 Windowed-MTP, F4 noyaux d'attention HIP), puis F2 (découpage du
 prefill selon une échéance) pour partager la marge.
+
+## 11. MTP à fenêtre glissante (F3)
+
+Idée (arXiv 2607.21535) : seule la tête MTP de brouillon regarde une fenêtre glissante des N derniers tokens ; les
+16 couches d'attention du modèle cible restent en attention complète, donc la sortie ne change pas (sans perte).
+
+Implémentation : `gguf_plugin/vllm_gguf_plugin/bonsai_mtp_window.py` déclare la couche d'attention MTP en
+`SlidingWindowSpec`, ce qui fait libérer ses anciens blocs KV par l'allocateur hybride. Le noyau HIP int4 n'a pas
+d'argument de fenêtre : pour cette couche, la table de blocs est recollectée sur les derniers blocs couvrant la
+fenêtre et `seq_lens` est décalé des tokens écartés. Pas de puits d'attention (les premiers blocs sont libérés aussi).
+
+Réglage : `--mtp-window N` du lanceur (défaut 4096, 0 = désactivé ; variable `BONSAI_MTP_WINDOW`). Nécessite
+`--kv int4` et `--draft mtp`.
+
+Résultats (`agent_bench`, 4 agents × 90k, `--sync-turns`, 1536 tokens de sortie) :
+
+| Config | Décodage froid | Décodage chaud (moy / min) | Delta prefill chaud | Acceptance | Pool KV |
+|---|---|---|---|---|---|
+| sans fenêtre | 52,9 t/s | 62,4 / 47,5 | 236 t/s | ~2,9-4,0 | 400k tokens |
+| fenêtre 4096 | 59,0 t/s | 65,2 / 46,5 | 250 t/s | ~2,9-4,0 | 424k tokens |
+
+L'acceptance ne baisse pas.
+
+Équivalence (prompt de 40k, température 0) : deux exécutions de la même config sont identiques. MTP à 2 tokens (sans
+fenêtre) et fenêtre 4096 divergent tous deux de MTP à 3 tokens au caractère 42. La divergence vient donc des formes
+de lots de vérification (arrondis flottants), pas de la fenêtre.
+
+Non fait : retenter MTP k=4 avec le KV libéré ; tailles de fenêtre autres que 4096.
