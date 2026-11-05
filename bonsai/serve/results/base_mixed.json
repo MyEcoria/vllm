@@ -1,0 +1,24 @@
+{
+ "prompt_tokens": 90024,
+ "ttft": 125.33772085400415,
+ "window": 125.33772085400415,
+ "prefill_tps": 718.2514520497922,
+ "cached_tokens": 0,
+ "uncached_prefill_tps": 718.2514520497922,
+ "exact_tokens": true,
+ "decoders": [
+  {
+   "mean": 37.08380819700785,
+   "worst": 24.0
+  },
+  {
+   "mean": 36.533295553807854,
+   "worst": 24.0
+  },
+  {
+   "mean": 36.206179345529605,
+   "worst": 24.0
+  }
+ ],
+ "early_decoders": []
+}

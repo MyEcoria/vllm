@@ -1925,8 +1925,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 prefill_in_place = prefill_out is not None
             else:
-                initial_state = ssm_state[prefill_state_indices]
-                initial_state[~prefill_has_initial_state, ...] = 0
+                initial_state = gather_prefill_initial_state(
+                    ssm_state,
+                    prefill_state_indices,
+                    attn_metadata.prefill_initial_state_mask,
+                    prefill_has_initial_state,
+                )
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -2391,6 +2395,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
 
 @eager_break_during_capture
+def gather_prefill_initial_state(
+    ssm_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    mask4d: torch.Tensor | None,
+    has_initial_state: torch.Tensor,
+) -> torch.Tensor:
+    """Gather prefill states, zeroing rows without history (no sync, no ~)."""
+    if mask4d is None:
+        mask4d = has_initial_state.view(-1, 1, 1, 1)
+    return torch.where(mask4d, ssm_state[state_indices], 0)
+
+
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
     b_or_ba: torch.Tensor,

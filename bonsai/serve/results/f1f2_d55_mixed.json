@@ -1,0 +1,31 @@
+{
+ "prompt_tokens": 90024,
+ "ttft": 269.51190710299124,
+ "window": 269.51190710299124,
+ "prefill_tps": 334.0260583203036,
+ "cached_tokens": 0,
+ "uncached_prefill_tps": 334.0260583203036,
+ "exact_tokens": true,
+ "decoders": [
+  {
+   "mean": 45.681712954336895,
+   "worst": 36.0,
+   "overlap": 196.13975528799347
+  },
+  {
+   "mean": 42.53275214496536,
+   "worst": 19.0,
+   "overlap": 218.13777693899465
+  },
+  {
+   "mean": 45.135902522555696,
+   "worst": 18.0,
+   "overlap": 209.76649343100144
+  }
+ ],
+ "early_decoders": [
+  0,
+  1,
+  2
+ ]
+}

@@ -1,0 +1,26 @@
+{
+ "prompts": [
+  "Write a Python function that merges two sorted lists.",
+  "Explain in three sentences how a hash map handles collisions.",
+  "List the first twelve prime numbers, separated by commas.",
+  "Translate to French: The quick brown fox jumps over the lazy dog."
+ ],
+ "outputs": [
+  "We need answer user: \"Write a Python function that merges two sorted lists.\" Simple. Need final with code maybe explanation. Ensure correct. Could include function merge_sorted_lists(a,b) returns new list. Maybe mention assumes ascending. Provide example.\n\n\n```python\ndef merge_sorted_lists(list1, list2):\n    \"\"\"\n    Merge two sorted lists into a single sorted list.\n\n    Args:\n        list1: First sorted list.\n        list2: Second sorted list.\n\n    Returns:\n        A new sorted list containing all elements from both lists.\n    \"\"\"\n    merged = []\n",
+  "We need to answer user: \"Explain in three sentences how a hash map handles collisions.\" Need final exactly three sentences? Likely yes. Need concise. Ensure three sentences. Could say: A hash map computes a hash code for each key and maps it to a bucket index. If two keys hash to the same bucket, it resolves the collision using chaining by storing linked list or separate array, or open addressing by probing neighboring slots. It continues until it finds an empty slot or existing key, then inserts/updates. Need exactly three sentences. Check sentence count: 1) A hash map computes a hash code for each key and maps",
+  "We need answer simple. Need final list first twelve primes separated by commas. First twelve primes: 2,3,5,7,11,13,17,19,23,29,31,37. Ensure no extra? User asks list separated by commas. Final just that.\n\n\n2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37",
+  "We need to answer user's request: \"Translate to French: The quick brown fox jumps over the lazy dog.\" Simple. Need final only translation. Need ensure correct French: \"Le rapide renard brun saute par-dessus le chien paresseux.\" Common pangram? In French maybe \"Le renard brun rapide saute par-dessus le chien paresseux.\" Which is better? English word order: The quick brown fox -> Le renard brun rapide? In French adjectives often after noun, but \"quick\" can be before? \"Le renard brun rapide\" sounds okay? \"Le rapide renard brun\""
+ ],
+ "divergence": [
+  null,
+  null,
+  141,
+  null
+ ],
+ "ratios": [
+  1.0,
+  1.0,
+  0.8844444444444445,
+  1.0
+ ]
+}
