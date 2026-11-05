@@ -53,6 +53,9 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 where = ["."]
 include = ["vllm*"]
 
+[tool.ruff]
+extend-exclude = ["bonsai/"]
+
 [tool.ruff.lint.per-file-ignores]
 # `vllm` is the only installed package; everything else is standalone scripts
 "!vllm/**" = ["INP"]

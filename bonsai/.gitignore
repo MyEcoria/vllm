@@ -1,0 +1,15 @@
+*.so
+*.o
+build/
+dist/
+*.egg-info
+__pycache__/
+*.gguf
+*.safetensors
+*.log
+.bonsai/
+api_key
+.pytest_cache/
+
+# root .gitignore hides *_hip* (generated in vllm); here they are sources
+!*_hip*
