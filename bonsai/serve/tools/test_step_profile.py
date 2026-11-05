@@ -1,4 +1,5 @@
 """Tests for step_profile on a tiny synthetic trace."""
+import json
 import sys
 from pathlib import Path
 
@@ -39,6 +40,28 @@ def test_cpu_report_self_time():
             e["tid"] = 1
     out = sp.cpu_report(ev, "mixed")
     assert "2 ops/step (1 aten)" in out and "parent" in out
+
+
+def test_prefill_rows_per_token(tmp_path):
+    """Prefill-only step: GPU ms per category divided by its prefill tokens, JSON dumped."""
+    ev = [{"cat": "user_annotation", "name": "execute_context_1(64)_generation_0(0)",
+           "ts": 0, "dur": 1000, "tid": 1},
+          {"cat": "cuda_runtime", "name": "hipLaunchKernel", "ts": 10, "args": {"correlation": 1}},
+          {"cat": "kernel", "name": "tern_m16", "ts": 100, "dur": 400, "args": {"correlation": 1}},
+          {"cat": "cuda_runtime", "name": "hipLaunchKernel", "ts": 20, "args": {"correlation": 2}},
+          {"cat": "kernel", "name": "rms_norm", "ts": 600, "dur": 100, "args": {"correlation": 2}},
+          {"cat": "cpu_op", "name": "aten::mm", "ts": 5, "dur": 200, "tid": 1}]
+    rows = sp.prefill_rows(ev)
+    assert len(rows) == 1 and rows[0]["tokens"] == 64 and rows[0]["launches"] == 2
+    assert abs(rows[0]["busy_ms"] - 0.5) < 1e-9 and abs(rows[0]["idle_ms"] - 0.1) < 1e-9
+    assert abs(rows[0]["cpu_ms"] - 0.2) < 1e-9 and not rows[0]["graph"]
+    assert abs(rows[0]["ms_per_token"]["ternary GEMM/GEMV"] - 0.4 / 64) < 1e-12
+    assert "norms/elementwise" in sp.prefill_table(rows)
+    path = tmp_path / "trace.json"
+    path.write_text(json.dumps({"traceEvents": ev}))
+    out = tmp_path / "out.json"
+    assert sp.main(["--prefill", "--json", str(out), str(path)]) == 0
+    assert '"tokens": 64' in out.read_text()
 
 
 def test_gap_stats():

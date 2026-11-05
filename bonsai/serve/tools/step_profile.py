@@ -12,7 +12,12 @@ CATEGORIES = (
     ("GDN/recurrent", ("gdn", "conv1d", "recurrent", "kda", "ssm", "delta", "fla")),
     ("MTP head", ("mtp", "w8_m16", "w8_")),
     ("sampling", ("sampl", "topk", "top_k", "topp", "argmax", "softmax", "logit", "rejection")),
+    ("act-quant", ("quant",)),
+    ("norms/elementwise", ("norm", "rms", "elementwise")),
 )
+CAT_LABELS = [label for label, _ in CATEGORIES] + ["other"]
+MODE_FLAGS = ("--cpu", "--gaps", "--prefill")
+CAT_WIDTH = max(len(label) for label in CAT_LABELS) + 2
 
 
 def load_trace(path):
@@ -207,23 +212,113 @@ def gap_report(events):
     return "\n".join(lines)
 
 
+def prefill_tokens(name):
+    """Return the prefill token count encoded in a step annotation."""
+    return int(STEP_RE.search(name).group(2))
+
+
+def step_cpu_ms(step, ops):
+    """Return a step's CPU ms: top-level cpu_op time on its thread."""
+    self_us, _ = step_self_times(step, ops)
+    return sum(self_us.values()) / 1000
+
+
+def prefill_rows(events):
+    """Return one metrics dict per prefill-only step, with ms/token per category."""
+    steps, kernels, runtime = split_events(events)
+    ops = [e for e in events if e.get("cat") == "cpu_op"]
+    groups = assign_kernels(steps, kernels, runtime)
+    rows = []
+    for i, s in enumerate(steps):
+        if step_kind(s["name"]) != "prefill" or not groups.get(i):
+            continue
+        m, tokens = summarize_step(s, groups[i], runtime), prefill_tokens(s["name"])
+        rows.append({"tokens": tokens, "wall_ms": m["cpu_ms"], "busy_ms": m["busy_ms"],
+                     "idle_ms": m["gap_ms"], "cpu_ms": step_cpu_ms(s, ops),
+                     "launches": m["kernels"], "graph": m["graph"], "gpu_ms": m["cats"],
+                     "ms_per_token": {c: v / tokens for c, v in m["cats"].items()}})
+    return rows
+
+
+def _metric_cells(r):
+    """Return the fixed-width metric columns of one prefill row."""
+    mode = "graph" if r["graph"] else "eager"
+    return (f"{r['tokens']:>7}{r['wall_ms']:>10.2f}{r['busy_ms']:>10.2f}"
+            f"{r['idle_ms']:>10.2f}{r['cpu_ms']:>10.2f}{r['launches']:>10d}{mode:>8}")
+
+
+def _cat_cells(values, fmt):
+    """Return one fixed-width cell per report category (missing -> 0)."""
+    return "".join(f"{values.get(c, 0.0):>{CAT_WIDTH}{fmt}}" for c in CAT_LABELS)
+
+
+def prefill_table(rows):
+    """Render prefill-only steps: metrics with GPU ms per category, then ms/token."""
+    if not rows:
+        return "no prefill-only steps"
+    head = (f"{'step':>5}{'tokens':>7}{'wall_ms':>10}{'busy_ms':>10}{'idle_ms':>10}"
+            f"{'cpu_ms':>10}{'launches':>10}{'mode':>8}")
+    cats = "".join(f"{c:>{CAT_WIDTH}}" for c in CAT_LABELS)
+    lines = [head + cats]
+    lines += [f"{i:>5}{_metric_cells(r)}{_cat_cells(r['gpu_ms'], '.3f')}"
+              for i, r in enumerate(rows)]
+    lines += ["", "ms per prefill token", f"{'step':>5}{'tokens':>7}{cats}"]
+    lines += [f"{i:>5}{r['tokens']:>7}{_cat_cells(r['ms_per_token'], '.5f')}"
+              for i, r in enumerate(rows)]
+    return "\n".join(lines)
+
+
+def take_json_arg(argv):
+    """Split out '--json PATH' and return (remaining argv, PATH or None)."""
+    if "--json" not in argv:
+        return argv, None
+    i = argv.index("--json")
+    if i + 1 >= len(argv):
+        raise SystemExit("--json needs a PATH")
+    return argv[:i] + argv[i + 2:], argv[i + 1]
+
+
+def prefill_report(paths, json_out=None):
+    """Print the prefill-only table per trace; optionally dump all rows as JSON."""
+    report = []
+    for path in paths:
+        rows = prefill_rows(load_trace(path))
+        print(f"== {path}")
+        print(prefill_table(rows))
+        report.append({"trace": str(path), "steps": rows})
+    if json_out:
+        with open(json_out, "w") as fh:
+            json.dump(report, fh, indent=2)
+    return 0
+
+
+def text_report(path, cpu, gaps):
+    """Return the text report for one trace in the selected mode."""
+    events = load_trace(path)
+    if gaps:
+        return gap_report(events)
+    if cpu:
+        return "\n".join((cpu_report(events, "mixed"), cpu_report(events, "decode")))
+    return format_report(analyse(events))
+
+
 def main(argv=None):
-    """CLI: step_profile.py [--cpu|--gaps] TRACE [TRACE...]."""
+    """CLI: step_profile.py [--cpu|--gaps|--prefill [--json PATH]] TRACE [TRACE...]."""
     argv = sys.argv[1:] if argv is None else argv
-    cpu, gaps = "--cpu" in argv, "--gaps" in argv
-    argv = [a for a in argv if a not in ("--cpu", "--gaps")]
+    modes = {f for f in MODE_FLAGS if f in argv}
+    argv, json_out = take_json_arg(argv)
+    argv = [a for a in argv if a not in MODE_FLAGS]
     if not argv:
         print(__doc__)
         return 2
+    if json_out and "--prefill" not in modes:
+        print("--json requires --prefill", file=sys.stderr)
+        return 2
+    if "--prefill" in modes:
+        return prefill_report(argv, json_out)
     for path in argv:
         print(f"== {path}")
-        events = load_trace(path)
-        if gaps:
-            print(gap_report(events))
-        elif cpu:
-            print(cpu_report(events, "mixed"), cpu_report(events, "decode"), sep="\n")
-        else:
-            print(format_report(analyse(events)))
+        print(text_report(path, "--cpu" in modes, "--gaps" in modes))
     return 0
 
 
