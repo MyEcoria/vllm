@@ -4,6 +4,7 @@ import json
 import random
 import subprocess
 import sys
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -118,11 +119,30 @@ def chat_text(args, headers, prompt, max_tokens):
         (m.get("content") or "")
 
 
+def server_count(args, headers, text):
+    """Return the /tokenize token count of text, or None if unavailable."""
+    try:
+        reply = post_json(args.url + "/tokenize", headers,
+                          {"model": args.model, "prompt": text})
+        return int(reply["count"])
+    except (urllib.error.URLError, KeyError, ValueError):
+        return None
+
+
+def fit_text(text, target, count):
+    """Trim text to about `target` tokens; estimate with 3% margin if no count."""
+    if count is None:
+        count, target = max(1, len(text) // 4), int(target * 0.97)
+    return text if count <= target else text[:len(text) * target // count]
+
+
 def needle_request(args, headers, rng_seed):
     """Run one needle request and return (found, depth, code)."""
     rng = random.Random(rng_seed)
     code, depth = rng.randrange(1000, 10000), rng.uniform(0.05, 0.95)
-    text = insert_needle(make_text(rng, args, headers, args.tokens), code, depth)
+    text = make_text(rng, args, headers, args.tokens)
+    text = fit_text(text, args.tokens, server_count(args, headers, text))
+    text = insert_needle(text, code, depth)
     prompt = (f"Read this code:\n{text}\n\nWhat is the secret code mentioned "
               "in a comment? Reply with just the number.")
     return needle_found(chat_text(args, headers, prompt, args.max_tokens),
@@ -177,15 +197,17 @@ def parse_args(argv=None):
     p.add_argument("--port", type=port_number, default=8000)
     p.add_argument("--model", default="bonsai")
     p.add_argument("--json", dest="json_path", default=None)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", dest="json_path", default=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
-    n = sub.add_parser("nll")
+    n = sub.add_parser("nll", parents=[common])
     n.add_argument("--tokens", type=positive, default=12000)
     n.add_argument("--text-file", default=None)
-    d = sub.add_parser("needle")
-    d.add_argument("--tokens", type=positive, default=100000)
+    d = sub.add_parser("needle", parents=[common])
+    d.add_argument("--tokens", type=positive, default=97000)
     d.add_argument("--seed", type=int, default=0)
     d.add_argument("--max-tokens", type=positive, default=400)
-    g = sub.add_parser("greedy")
+    g = sub.add_parser("greedy", parents=[common])
     g.add_argument("--max-tokens", type=positive, default=128)
     g.add_argument("--save", default=None)
     g.add_argument("--compare", default=None)
@@ -198,7 +220,12 @@ def main(argv=None):
     """Run the chosen subcommand, print one summary line, optionally dump JSON."""
     args = parse_args(argv)
     runner = {"nll": run_nll, "needle": run_needle, "greedy": run_greedy}
-    line, data = runner[args.cmd](args, build_headers())
+    try:
+        line, data = runner[args.cmd](args, build_headers())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"HTTP {e.code}: {body}", file=sys.stderr)
+        return 1
     print(line)
     if args.json_path:
         Path(args.json_path).write_text(json.dumps(data, indent=1))

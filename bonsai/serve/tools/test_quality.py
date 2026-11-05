@@ -67,3 +67,14 @@ def test_select_files_stable():
     assert quality.select_files(a) == quality.select_files(b)
     many = "\n".join(f"vllm/{i:05d}.py" for i in range(quality.MAX_FILES + 5))
     assert len(quality.select_files(many)) == quality.MAX_FILES
+
+
+def test_fit_text_and_json_after_subcommand():
+    """Oversized text is trimmed, margin applies without count, --json works late."""
+    assert quality.fit_text("x" * 200, 50, 100) == "x" * 100
+    assert quality.fit_text("x" * 200, 50, 40) == "x" * 200
+    assert len(quality.fit_text("x" * 400, 100, None)) < 400
+    a = quality.parse_args(["greedy", "--json", "o.json"])
+    assert a.json_path == "o.json"
+    assert quality.parse_args(["--json", "p.json", "nll"]).json_path == "p.json"
+    assert quality.parse_args(["nll"]).json_path is None

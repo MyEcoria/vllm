@@ -94,3 +94,51 @@ def test_uncached_prefill_used_by_check():
     assert not ab.mixed_verdict(s, 200, 1)
     fb = ab.summarize_mixed(1000, 2.0, 0.0, 1.0, dec)
     assert not fb["exact_tokens"] and "no usage" in ab.format_mixed(fb)
+
+
+def test_early_decoders_detected():
+    assert ab.early_decoders([10.0, 4.0, None], 5.0) == [1, 2]
+    assert ab.early_decoders([6.0, 7.0], 5.0) == []
+
+
+def test_mixed_phase_order_with_fakes(monkeypatch):
+    log, lock = [], __import__("threading").Lock()
+
+    def fake_stream(args, headers, prompt, on_first=None, counts=None, stop=None):
+        kind = {1: "warm", 16: "fourth"}.get(args.max_tokens, "decoder")
+        with lock:
+            log.append(kind)
+        now = ab.time.perf_counter()
+        if kind == "decoder":
+            times = []
+            while not stop.is_set():
+                times.append(ab.time.perf_counter())
+                counts.append(len(times) * 2)
+                if len(times) == 1 and on_first:
+                    on_first()
+                ab.time.sleep(0.001)
+            return "", times, None, now
+        if kind == "fourth":
+            ab.time.sleep(0.05)
+            on_first()
+            return "", [ab.time.perf_counter()], {"prompt_tokens": 100}, now
+        return "", [now], None, now
+
+    monkeypatch.setattr(ab, "stream_request", fake_stream)
+    monkeypatch.setattr(ab, "make_text", lambda rng, a, h, n, prefix="": prefix)
+    args = ab.parse_args(["--mixed"])
+    summary, errors = ab.run_mixed(args, {})
+    assert errors == [] and summary["early_decoders"] == []
+    assert log[:3] == ["warm"] * 3 and log[-1] == "fourth"
+    assert log[3:6] == ["decoder"] * 3
+
+
+def test_partial_overlap_window_per_decoder():
+    dec = [[i * 0.1 for i in range(100)]] * 2
+    s = ab.summarize_mixed(1000, 20.0, 0.0, 20.0, dec, None, None, [5.0, 25.0])
+    assert s["decoders"][0]["overlap"] == 5.0 and s["decoders"][1]["overlap"] == 20.0
+    assert s["decoders"][0]["mean"] == 10.0 and s["decoders"][1]["mean"] == 5.0
+    line = ab.format_mixed(s)
+    assert "[partial window 5 s of 20 s]" in line and "d0 10.0" in line
+    full = ab.summarize_mixed(1000, 20.0, 0.0, 20.0, dec, None, None, [30.0, 25.0])
+    assert "partial" not in ab.format_mixed(full)

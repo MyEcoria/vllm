@@ -14,6 +14,7 @@ from pathlib import Path
 DEFAULT_URL = "http://127.0.0.1:8000"
 TARGET_PREFILL = 600.0
 TARGET_DECODE = 60.0
+MIN_OVERLAP = 10.0
 WORDS = ("alpha beta gamma delta kernel buffer socket thread queue token cache "
          "stream parse index merge split value error retry commit branch build "
          "module config schema router handler worker driver tensor shard").split()
@@ -63,7 +64,7 @@ def parse_args(argv=None):
                    help="4th request is a warm agent sending only N new tokens")
     p.add_argument("--mixed-tokens", type=int, default=99000,
                    help="context size of the warm agents and the cold 4th prompt")
-    p.add_argument("--mixed-max-tokens", type=int, default=1500)
+    p.add_argument("--mixed-max-tokens", type=int, default=20000)
     p.add_argument("--check", action="store_true",
                    help="--mixed: exit 1 if below the thresholds")
     p.add_argument("--min-prefill", type=float, default=TARGET_PREFILL)
@@ -142,7 +143,8 @@ def window_min_rate(times, generated, window=1.0):
     return min(rates)
 
 
-def stream_request(args, headers, prompt, on_first=None, counts=None):
+def stream_request(args, headers, prompt, on_first=None, counts=None,
+                   stop=None):
     """Stream one completion; return text, chunk times, usage and t0."""
     payload = {"model": args.model, "prompt": prompt, "max_tokens": args.max_tokens,
                "temperature": 0, "ignore_eos": True, "stream": True,
@@ -153,6 +155,8 @@ def stream_request(args, headers, prompt, on_first=None, counts=None):
     text, times, usage, t0 = [], [], None, time.perf_counter()
     with urllib.request.urlopen(req, timeout=1800) as r:
         for line in r:
+            if stop is not None and stop.is_set():
+                break
             obj = parse_sse_line(line)
             if not isinstance(obj, dict):
                 continue
@@ -333,14 +337,16 @@ def mixed_verdict(summary, min_prefill, min_decode):
 
 
 def summarize_mixed(prompt_tokens, ttft, start, end, decoder_times,
-                    decoder_counts=None, cached=None):
+                    decoder_counts=None, cached=None, ends=None):
     """Build the mixed-run summary dict from timestamps and cumulative counts."""
     decoders, exact = [], True
     for i, times in enumerate(decoder_times):
         w, ok = chunk_weights((decoder_counts or [None] * len(decoder_times))[i] or [])
         exact = exact and ok
-        mean, worst = window_stats(times, start, end, w if ok else None)
-        decoders.append({"mean": mean, "worst": worst})
+        stop = end if not ends or ends[i] is None else min(end, ends[i])
+        mean, worst = window_stats(times, start, stop, w if ok else None)
+        decoders.append({"mean": mean, "worst": worst,
+                         "overlap": max(0.0, stop - start)})
     rate = lambda n: n / ttft if ttft > 0 else 0.0
     return {"prompt_tokens": prompt_tokens, "ttft": ttft, "window": end - start,
             "prefill_tps": rate(prompt_tokens), "cached_tokens": cached,
@@ -351,29 +357,34 @@ def summarize_mixed(prompt_tokens, ttft, start, end, decoder_times,
 
 def format_mixed(s):
     """Format the one-line mixed summary."""
-    dec = " ".join(f"d{i} {d['mean']:.1f}/{d['worst']:.1f}"
+    dec = " ".join(f"d{i} {d['mean']:.1f}/{d['worst']:.1f} ({d['overlap']:.0f}s)"
                    for i, d in enumerate(s["decoders"]))
+    short = min(d["overlap"] for d in s["decoders"])
+    part = f" [partial window {short:.0f} s of {s['window']:.0f} s]" \
+        if short < s["window"] else ""
     unc = s.get("uncached_prefill_tps")
     unc = "" if unc is None else f", uncached {unc:.0f} t/s"
     note = "" if s.get("exact_tokens", True) else " [tokens=chunks: no usage]"
     return (f"mixed: prefill {s['prefill_tps']:.0f} t/s{unc} (prompt "
             f"{s['prompt_tokens']} ttft {s['ttft']:.2f}s) decoders mean/worst1s "
-            f"t/s: {dec}{note}")
+            f"t/s: {dec}{note}{part}")
 
 
-def start_decoders(args, headers, prompts, errors):
-    """Start one thread per warm prompt; return threads, times, counts, events."""
+def start_decoders(args, headers, prompts, errors, stop):
+    """Start one thread per warm prompt; return threads, times, counts, events, ends."""
     cfg = copy.copy(args)
     cfg.max_tokens = args.mixed_max_tokens
     events = [threading.Event() for _ in prompts]
     times = [[] for _ in prompts]
     counts = [[] for _ in prompts]
+    ends = [None] * len(prompts)
 
     def work(i):
         """Stream one warm decoder and store its chunk times."""
         try:
             times[i] = stream_request(cfg, headers, prompts[i], events[i].set,
-                                    counts[i])[1]
+                                    counts[i], stop)[1]
+            ends[i] = time.perf_counter()
         except Exception as exc:
             errors.append(f"decoder {i}: {exc!r}")
             events[i].set()
@@ -381,7 +392,33 @@ def start_decoders(args, headers, prompts, errors):
     threads = [threading.Thread(target=work, args=(i,)) for i in range(len(prompts))]
     for t in threads:
         t.start()
-    return threads, times, counts, events
+    return threads, times, counts, events, ends
+
+
+def warm_prefixes(args, headers, prompts):
+    """Phase 1: prefill each prompt sequentially with max_tokens=1; return seconds."""
+    cfg = copy.copy(args)
+    cfg.max_tokens = 1
+    t0 = time.perf_counter()
+    for prompt in prompts:
+        stream_request(cfg, headers, prompt)
+    return time.perf_counter() - t0
+
+
+def decoded_tokens(counts):
+    """Return tokens decoded so far from per-chunk usage counts (chunks if absent)."""
+    last = [c for c in counts if c is not None]
+    return last[-1] if last else len(counts)
+
+
+def wait_decoding(counts, ends, min_tokens=32, timeout=900.0):
+    """Block until every decoder streamed min_tokens (or ended / timed out)."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if all(decoded_tokens(c) >= min_tokens or e is not None
+               for c, e in zip(counts, ends)):
+            return
+        time.sleep(0.05)
 
 
 def fourth_prompt(args, headers, rng, warm_prompt_fn):
@@ -395,6 +432,11 @@ def fourth_prompt(args, headers, rng, warm_prompt_fn):
     return prefix + make_text(rng, args, headers, args.mixed_delta, "[tool] ")
 
 
+def early_decoders(ends, window_end):
+    """Return indexes of decoder streams that ended before the window end."""
+    return [i for i, e in enumerate(ends) if e is None or e < window_end]
+
+
 def run_mixed(args, headers):
     """Run the mixed scenario; return (summary or None, errors)."""
     rng = random.Random(args.seed)
@@ -404,21 +446,27 @@ def run_mixed(args, headers):
                                   headers, args.mixed_tokens, "# a3 ")
     last = fourth_prompt(args, headers, rng, prefix_fn)
     errors = []
-    threads, times, counts, events = start_decoders(args, headers, prompts, errors)
-    for e in events:
-        e.wait()
+    stop = threading.Event()
+    warm_s = warm_prefixes(args, headers, prompts)
+    t1 = time.perf_counter()
+    threads, times, counts, events, ends = start_decoders(
+        args, headers, prompts, errors, stop)
+    wait_decoding(counts, ends)
+    print(f"phase 1 warm-up {warm_s:.1f}s; phase 2 decoders ready "
+          f"{time.perf_counter() - t1:.1f}s; phase 3 4th request", flush=True)
     cfg = copy.copy(args)
     cfg.max_tokens = 16
     summary = None
     try:
-        _, t4, usage, start = stream_request(cfg, headers, last)
+        _, t4, usage, start = stream_request(cfg, headers, last, stop.set)
         usage = usage or {}
         tokens = usage.get("prompt_tokens", len(last) // 4)
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         for t in threads:
             t.join()
         summary = summarize_mixed(tokens, t4[0] - start, start, t4[0], times,
-                                  counts, cached)
+                                  counts, cached, ends)
+        summary["early_decoders"] = early_decoders(ends, t4[0])
     except Exception as exc:
         errors.append(f"4th request: {exc!r}")
     return summary, errors
@@ -431,6 +479,12 @@ def main_mixed(args, headers):
         print("ERROR", e, file=sys.stderr)
     if summary is None:
         return 1
+    short = [i for i in summary.get("early_decoders", [])
+             if summary["decoders"][i]["overlap"] < MIN_OVERLAP]
+    if short:
+        print(f"ERROR decoders {short} overlap the prefill < {MIN_OVERLAP:.0f} s",
+              file=sys.stderr)
+        return 2
     print(format_mixed(summary))
     if args.json_path:
         Path(args.json_path).write_text(json.dumps(summary, indent=1))
