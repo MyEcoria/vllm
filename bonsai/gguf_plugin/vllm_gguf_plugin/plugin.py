@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import os
 from functools import wraps
 from pathlib import Path
@@ -222,7 +223,7 @@ def register() -> None:
         from .bonsai_int4_attn import patch as _patch_int4_attn
 
         _patch_int4_attn()
-        _enable_kv_evict()
+    _enable_kv_evict(os.environ.get("BONSAI_INT4_ATTN") == "1")
     if os.environ.get("BONSAI_MTP_W8") == "1":
         from .bonsai_mtp_w8 import patch as _patch_mtp_w8
 
@@ -237,12 +238,14 @@ def register() -> None:
         _patch_gdn_recoverssm()
 
 
-def _enable_kv_evict() -> None:
-    """Enable the opt-in virtual KV eviction (BONSAI_KV_EVICT=lag); needs the int4 attention."""
+def _enable_kv_evict(int4: bool) -> None:
+    """Enable the opt-in KV eviction (BONSAI_KV_EVICT=lag); warn and stay off if unsupported."""
     mode = os.environ.get("BONSAI_KV_EVICT", "")
     if mode == "kvzip":
-        raise NotImplementedError("BONSAI_KV_EVICT=kvzip is not implemented yet (use 'lag')")
-    if mode == "lag":
+        logging.getLogger(__name__).warning("BONSAI_KV_EVICT=kvzip is not implemented; eviction off (use 'lag')")
+    elif mode == "lag" and not int4:
+        logging.getLogger(__name__).warning("BONSAI_KV_EVICT=lag needs BONSAI_INT4_ATTN=1; eviction off")
+    elif mode == "lag":
         from .bonsai_kv_evict import patch as _patch_kv_evict
 
         _patch_kv_evict()

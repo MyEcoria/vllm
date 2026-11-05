@@ -115,3 +115,15 @@ def test_record_scores_resets_touched_and_scores_partitions():
     assert torch.isfinite(scores[5:7]).all() and scores[0] == 0.5
     ke.record_scores(scores, k[:1], k[:1], torch.tensor([7 * 256]), 256, part=64)
     assert torch.isinf(scores[7])
+
+
+def test_record_scores_padded_slots_do_not_crash():
+    """CUDA-graph padded batches (slots == -1) must not index with a negative block."""
+    from vllm_gguf_plugin import bonsai_kv_evict as ke
+
+    bs = 16
+    scores = ke.score_buffer(64, torch.device("cpu"))
+    slots = torch.cat([torch.arange(3 * bs, 3 * bs + 300), torch.full((212,), -1)])
+    k = torch.randn(512, 2, 8)
+    ke.record_scores(scores, k, k.clone(), slots, bs, part=64)
+    assert torch.isfinite(scores[3:6]).any()

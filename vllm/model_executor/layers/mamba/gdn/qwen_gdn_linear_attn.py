@@ -2394,7 +2394,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
 
-@eager_break_during_capture
 def gather_prefill_initial_state(
     ssm_state: torch.Tensor,
     state_indices: torch.Tensor,
@@ -2407,6 +2406,7 @@ def gather_prefill_initial_state(
     return torch.where(mask4d, ssm_state[state_indices], 0)
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
     b_or_ba: torch.Tensor,

@@ -174,13 +174,15 @@ def record_scores(scores, key, value, slots, bs, part=64):
     the `part`-token partitions seen across updates (fixed shapes: graph safe).
     """
     slots = slots.long()
-    reset = torch.where(slots % bs == 0, slots // bs, torch.full_like(slots, -1))
+    dummy = scores.shape[0] - 1
+    reset = torch.where((slots >= 0) & (slots % bs == 0), slots // bs, torch.full_like(slots, dummy))
     scores.index_fill_(0, reset, float("inf"))
     _S.acc.index_fill_(1, reset, 0.0)
     if slots.shape[0] < 2 * part:
         return
     sub, ok, first = _partition_scores(key, value, slots, part)
-    blk, w = first // bs, ok.float()
+    ok = ok & (first >= 0)
+    blk, w = torch.where(ok, first // bs, torch.full_like(first, dummy)), ok.float()
     _S.acc[0].index_add_(0, blk, torch.nan_to_num(sub) * w)
     _S.acc[1].index_add_(0, blk, w)
     cnt = _S.acc[1][blk]

@@ -37,6 +37,24 @@ def test_insert_needle_and_found():
     assert not quality.needle_found(None, 4242)
 
 
+def test_chat_text_ignores_reasoning(monkeypatch):
+    """A code that appears only in reasoning is not part of the answer."""
+    reply = {"choices": [{"message": {"reasoning_content": "code is 4242",
+                                      "content": "unknown"}}]}
+    monkeypatch.setattr(quality, "post_json", lambda *a: reply)
+    args = quality.parse_args(["needle"])
+    text = quality.chat_text(args, {}, "prompt", 8)
+    assert text == "unknown"
+    assert not quality.needle_found(text, 4242)
+
+
+def test_greedy_compare_rejects_count_mismatch():
+    """A baseline with a different number of prompts is refused, not zipped."""
+    with pytest.raises(SystemExit):
+        quality.check_same_count(["a", "b"], ["a"])
+    quality.check_same_count(["a"], ["b"])
+
+
 def test_first_divergence():
     """Equal strings give None; otherwise the first differing index."""
     assert quality.first_divergence("abc", "abc") is None

@@ -1,0 +1,14 @@
+{
+ "prompts": [
+  "Write a Python function that merges two sorted lists.",
+  "Explain in three sentences how a hash map handles collisions.",
+  "List the first twelve prime numbers, separated by commas.",
+  "Translate to French: The quick brown fox jumps over the lazy dog."
+ ],
+ "outputs": [
+  "\n\n```python\ndef merge_sorted_lists(list1, list2):\n    \"\"\"\n    Merge two sorted lists into a single sorted list.\n\n    Args:\n        list1: First sorted list.\n        list2: Second sorted list.\n\n    Returns:\n        A new sorted list containing all elements from both lists.\n    \"\"\"\n    merged = []\n",
+  "",
+  "\n\n2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37",
+  ""
+ ]
+}

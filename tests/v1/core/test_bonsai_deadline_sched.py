@@ -107,9 +107,11 @@ def test_auto_cap_shrinks_when_slow_and_grows_when_fast():
     scheduler, clock = _auto(50.0)
     _start_decoders(scheduler, 3)
     first = scheduler._deadline_prefill_cap()
+    scheduler._step_had_prefill = True
     clock.t += 0.100  # previous step took 100 ms -> ratio 0.5
     assert scheduler._deadline_prefill_cap() == max(16, int(first * 0.5))
     cap = scheduler._auto_cap
+    scheduler._step_had_prefill = True
     clock.t += 0.010  # 10 ms -> ratio clamped to 1.25
     assert scheduler._deadline_prefill_cap() == int(cap * 1.25)
 
@@ -119,8 +121,34 @@ def test_auto_cap_bounds_and_reset():
     _start_decoders(scheduler, 3)
     scheduler._deadline_prefill_cap()
     for _ in range(20):
+        scheduler._step_had_prefill = True
         clock.t += 1.0
         assert scheduler._deadline_prefill_cap() == 16
     scheduler.running = []
     assert scheduler._deadline_prefill_cap() is None
     assert scheduler._auto_cap is None and scheduler._last_sched_time is None
+
+
+def test_auto_cap_no_windup_on_decode_only_steps():
+    scheduler, clock = _auto(50.0)
+    _start_decoders(scheduler, 3)
+    first = scheduler._deadline_prefill_cap()
+    for _ in range(10):  # fast decode-only steps must not grow the cap
+        clock.t += 0.001
+        assert scheduler._deadline_prefill_cap() == first
+
+
+def test_no_cap_when_chunked_prefill_disabled():
+    scheduler = _make(60.0)
+    _start_decoders(scheduler, 3)
+    object.__setattr__(scheduler.scheduler_config, "enable_chunked_prefill", False)
+    assert scheduler._deadline_prefill_cap() is None
+
+
+def test_cap_floor_is_block_size_in_mamba_align_mode():
+    scheduler = _make(60.0, min_chunk=1)
+    scheduler.need_mamba_block_aligned_split = True
+    assert scheduler._cap_floor() == max(1, scheduler.block_size)
+    scheduler.cost_model = (1000.0, 1.0, 1.0, 0.0)  # static cap would be tiny
+    _start_decoders(scheduler, 1)
+    assert scheduler._deadline_prefill_cap() >= scheduler.block_size

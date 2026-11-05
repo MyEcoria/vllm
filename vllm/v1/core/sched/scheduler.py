@@ -415,6 +415,8 @@ class Scheduler(SchedulerInterface):
         self._clock = time.perf_counter
         self._auto_cap: float | None = None
         self._last_sched_time: float | None = None
+        # True once the current step granted prefill tokens under the cap.
+        self._step_had_prefill = False
         if self.local_prefill_interval > 1:
             # Neither the hold nor its release is otherwise visible in logs or
             # stats, which makes a misapplied cadence hard to diagnose.
@@ -714,6 +716,9 @@ class Scheduler(SchedulerInterface):
         """
         if self.decode_deadline_ms is None:
             return None
+        if not self.scheduler_config.enable_chunked_prefill:
+            # A cap would stall prompts longer than it: never apply it.
+            return None
         decoders = [r for r in self.running if not r.is_prefill_chunk]
         if not decoders:
             self._auto_cap = self._last_sched_time = None
@@ -724,6 +729,13 @@ class Scheduler(SchedulerInterface):
         if self.cost_model is None:
             return self._auto_cap_update(decoders, num_decode)
         return self._static_cap(num_decode)
+
+    def _cap_floor(self) -> int:
+        """Smallest cap; at least one block in Mamba align mode (else 0 chunks)."""
+        floor = self.scheduler_config.min_prefill_chunk
+        if self.need_mamba_block_aligned_split:
+            floor = max(floor, self.block_size)
+        return floor
 
     def _static_cap(
         self, num_decode: int, model: tuple[float, ...] | None = None
@@ -738,7 +750,7 @@ class Scheduler(SchedulerInterface):
         per_token = c + d * ctx / 1e5
         if per_token <= 0:
             return None
-        floor = self.scheduler_config.min_prefill_chunk
+        floor = self._cap_floor()
         return max(
             floor, int((self.decode_deadline_ms - a - b * num_decode) / per_token)
         )
@@ -747,17 +759,19 @@ class Scheduler(SchedulerInterface):
         """Feedback controller: cap *= clamp(D / t_prev, 0.5, 1.25)."""
         assert self.decode_deadline_ms is not None
         now = self._clock()
+        # Adapt only from steps that ran prefill; decode-only steps say
+        # nothing about the cost of prefill tokens.
         t_prev_ms = (
             None
             if self._last_sched_time is None
             else (now - self._last_sched_time) * 1e3
         )
         self._last_sched_time = now
-        floor = self.scheduler_config.min_prefill_chunk
+        floor = self._cap_floor()
         ceil = max(floor, self.scheduler_config.max_num_batched_tokens - num_decode)
         if self._auto_cap is None:
             self._auto_cap = float(self._static_cap(num_decode) or ceil)
-        elif t_prev_ms and t_prev_ms > 0:
+        elif t_prev_ms and t_prev_ms > 0 and self._step_had_prefill:
             ratio = min(1.25, max(0.5, self.decode_deadline_ms / t_prev_ms))
             self._auto_cap *= ratio
         self._auto_cap = min(float(ceil), max(float(floor), self._auto_cap))
@@ -859,6 +873,7 @@ class Scheduler(SchedulerInterface):
 
         # Decode-deadline prefill token cap (None = unlimited / mode off).
         prefill_cap = self._deadline_prefill_cap()
+        self._step_had_prefill = False
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1072,6 +1087,7 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             if prefill_cap is not None and request.is_prefill_chunk:
                 prefill_cap -= num_new_tokens
+                self._step_had_prefill = True
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
@@ -1652,6 +1668,7 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 if prefill_cap is not None:
                     prefill_cap -= num_new_tokens
+                    self._step_had_prefill = True
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)

@@ -109,14 +109,12 @@ def run_nll(args, headers):
 
 
 def chat_text(args, headers, prompt, max_tokens):
-    """Send one greedy chat request and return content plus reasoning."""
+    """Send one greedy chat request and return the answer content only."""
     reply = post_json(args.url + "/v1/chat/completions", headers,
                       {"model": args.model, "temperature": 0,
                        "max_tokens": max_tokens,
                        "messages": [{"role": "user", "content": prompt}]})
-    m = reply["choices"][0]["message"]
-    return (m.get("reasoning_content") or m.get("reasoning") or "") + \
-        (m.get("content") or "")
+    return reply["choices"][0]["message"].get("content") or ""
 
 
 def server_count(args, headers, text):
@@ -159,6 +157,13 @@ def run_needle(args, headers):
     return f"NEEDLE found {k}/4 tokens~{args.tokens}", {"found": k, "runs": rows}
 
 
+def check_same_count(base, outs):
+    """Raise SystemExit when baseline and current output counts differ."""
+    if len(base) != len(outs):
+        raise SystemExit(f"baseline has {len(base)} outputs, "
+                         f"current run has {len(outs)}; not comparable")
+
+
 def run_greedy(args, headers):
     """Run the fixed greedy prompts; save or compare against a baseline."""
     outs = [chat_text(args, headers, p, args.max_tokens) for p in GREEDY_PROMPTS]
@@ -168,6 +173,7 @@ def run_greedy(args, headers):
     if not args.compare:
         return f"GREEDY saved={bool(args.save)} prompts={len(outs)}", data
     base = json.loads(Path(args.compare).read_text())["outputs"]
+    check_same_count(base, outs)
     divs = [first_divergence(a, b) for a, b in zip(base, outs)]
     ratios = [match_ratio(a, b) for a, b in zip(base, outs)]
     data.update(divergence=divs, ratios=ratios)
