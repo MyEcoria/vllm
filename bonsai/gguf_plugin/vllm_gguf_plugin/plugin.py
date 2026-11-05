@@ -222,6 +222,7 @@ def register() -> None:
         from .bonsai_int4_attn import patch as _patch_int4_attn
 
         _patch_int4_attn()
+        _enable_kv_evict()
     if os.environ.get("BONSAI_MTP_W8") == "1":
         from .bonsai_mtp_w8 import patch as _patch_mtp_w8
 
@@ -234,3 +235,14 @@ def register() -> None:
         from .bonsai_gdn_recoverssm import patch as _patch_gdn_recoverssm
 
         _patch_gdn_recoverssm()
+
+
+def _enable_kv_evict() -> None:
+    """Enable the opt-in virtual KV eviction (BONSAI_KV_EVICT=lag); needs the int4 attention."""
+    mode = os.environ.get("BONSAI_KV_EVICT", "")
+    if mode == "kvzip":
+        raise NotImplementedError("BONSAI_KV_EVICT=kvzip is not implemented yet (use 'lag')")
+    if mode == "lag":
+        from .bonsai_kv_evict import patch as _patch_kv_evict
+
+        _patch_kv_evict()
