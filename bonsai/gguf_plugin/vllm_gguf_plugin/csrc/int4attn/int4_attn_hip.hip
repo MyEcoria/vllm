@@ -316,8 +316,9 @@ __device__ __forceinline__ void load_tile(TileRegs& R, const uint8_t* __restrict
   R.vsp = *reinterpret_cast<const float*>(krow + KV_OFF_VS);
 }
 
-__device__ __forceinline__ void compute_tile(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
-                                             v8f acc_o[16], float& m, float& l, float& corr) {
+// QK^T + online-softmax update for one 16-key tile; returns the probabilities p and the rescale factor alpha.
+__device__ __forceinline__ void score_step(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
+                                           float& m, float& l, float& corr, v8h& p, float& alpha) {
   const int h = lane >> 4;
   v8i sacc = {0, 0, 0, 0, 0, 0, 0, 0}, sacc2 = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
@@ -345,8 +346,7 @@ __device__ __forceinline__ void compute_tile(const QTile& Q, const TileRegs& R, 
   }
   mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
   const float m_new = fmaxf(m, mx);
-  const float alpha = (m_new == -INFINITY) ? 1.f : exp2f(m - m_new);
-  v8h p;
+  alpha = (m_new == -INFINITY) ? 1.f : exp2f(m - m_new);
   float psum = 0.f, pz = 0.f;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -360,6 +360,13 @@ __device__ __forceinline__ void compute_tile(const QTile& Q, const TileRegs& R, 
   l = l * alpha + psum;
   corr = corr * alpha + pz;
   m = m_new;
+}
+
+__device__ __forceinline__ void compute_tile(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
+                                             v8f acc_o[16], float& m, float& l, float& corr) {
+  v8h p;
+  float alpha;
+  score_step(Q, R, tok0, seq_len, lane, m, l, corr, p, alpha);
   // rescale only when some row's max moved (wave-uniform branch)
   if (__builtin_amdgcn_ballot_w32(alpha != 1.f)) {
 #pragma unroll

@@ -21,6 +21,7 @@ V3 = os.environ.get("BONSAI_KV_V3", "1") == "1"
 CONTENT_BYTES = 232 if V3 else 264
 NUM_SPLITS = int(os.environ.get("BONSAI_INT4_SPLITS", "32"))
 PF_ROWS = 64  # rows per prefill work item (4 waves x 16)
+SPLIT_CAP = int(os.environ.get("BONSAI_INT4_SPLIT_CAP", "1024"))
 CHUNK_SPLITK_MAX = int(os.environ.get("BONSAI_CHUNK_SPLITK_MAX", "256"))
 OVERLAP = os.environ.get("BONSAI_ATTN_OVERLAP", "1") == "1"
 
@@ -71,11 +72,11 @@ class _Scratch:
 
     def part_bufs(self, nseq, nkv, qtiles, device):
         """Fixed-size buffers (never reallocated: CUDA graphs keep their address)."""
-        splits = max(1, min(NUM_SPLITS, 1024 // (nseq * nkv * qtiles)))
+        splits = max(1, min(NUM_SPLITS, SPLIT_CAP // (nseq * nkv * qtiles)))
         n = nseq * nkv * qtiles * splits * 16
         b = self.part.get(device)
         if b is None:
-            rows = max(n, 1024 * 16 + 4 * 4 * 3 * 16)
+            rows = max(n, SPLIT_CAP * 16 + 4 * 4 * 3 * 16)
             b = (torch.empty(rows, 256, dtype=torch.float32, device=device),
                  torch.empty(rows, 2, dtype=torch.float32, device=device))
             self.part[device] = b
@@ -118,6 +119,12 @@ class _Scratch:
 
 
 _S = _Scratch()
+
+
+def decode_call(e, q8, qs, qsum, cache, block_table, seq_lens, qsl, ids, qtiles, out):
+    """Launch the decode attention on all sequences `ids` (used by the decode microbench / tests)."""
+    po, pml, splits = _S.part_bufs(ids.shape[0], cache.shape[1], qtiles, q8.device)
+    e.attn_decode(q8, qs, qsum, cache, block_table, seq_lens, qsl, ids, qtiles, splits, po, pml, out)
 
 
 def _prepare(md, common):
@@ -216,14 +223,14 @@ def patch():
                 po, pml, splits = _S.part_bufs(dec_ids.shape[0], nkv, qtiles, query.device)
                 with torch.cuda.stream(side):
                     e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                                  attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
+                  attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
             elif has_dec:
                 po, pml, splits = _S.part_bufs(dec_ids.shape[0], nkv, qtiles, query.device)
                 e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                              attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
+                  attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
             co, cml, csplits = _S.chunk_bufs(chunk_ids.shape[0], nkv, chunk_qtiles, query.device)
             e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                          attn_metadata.query_start_loc, chunk_ids, chunk_qtiles, csplits, co, cml, out)
+                  attn_metadata.query_start_loc, chunk_ids, chunk_qtiles, csplits, co, cml, out)
             if work is not None:
                 e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
                                attn_metadata.query_start_loc, work, out)
@@ -239,7 +246,7 @@ def patch():
             po, pml, splits = _S.part_bufs(dec_ids.shape[0], nkv, qtiles, query.device)
             with torch.cuda.stream(side):
                 e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                              attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
+                  attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
             e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
                            attn_metadata.query_start_loc, work, out)
             main.wait_stream(side)
@@ -247,7 +254,7 @@ def patch():
         if has_dec:
             po, pml, splits = _S.part_bufs(dec_ids.shape[0], nkv, qtiles, query.device)
             e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                          attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
+                  attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
         if work is not None:
             e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
                            attn_metadata.query_start_loc, work, out)
