@@ -316,31 +316,22 @@ __device__ __forceinline__ void load_tile(TileRegs& R, const uint8_t* __restrict
   R.vsp = *reinterpret_cast<const float*>(krow + KV_OFF_VS);
 }
 
-// QK^T + online-softmax update for one 16-key tile; returns the probabilities p and the rescale factor alpha.
-__device__ __forceinline__ void score_step(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
-                                           float& m, float& l, float& corr, v8h& p, float& alpha) {
+// Online-softmax update of one 16-key tile from its integer scores sacc; returns p and the rescale factor alpha.
+__device__ __forceinline__ void softmax_tile(float qsc, float qsum, int qpos, v8i sacc, float ksp, float vsp, int tok0,
+                                             int seq_len, int lane, float& m, float& l, float& corr, v8h& p,
+                                             float& alpha) {
   const int h = lane >> 4;
-  v8i sacc = {0, 0, 0, 0, 0, 0, 0, 0}, sacc2 = {0, 0, 0, 0, 0, 0, 0, 0};
-#pragma unroll
-  for (int s = 0; s < 16; s += 2) {
-    const uint32_t w = R.kb[s >> 2][s & 3], w2 = R.kb[(s + 1) >> 2][(s + 1) & 3];
-    v2i a = {(int)(w & 0x0F0F0F0Fu), (int)((w >> 4) & 0x0F0F0F0Fu)};
-    v2i a2 = {(int)(w2 & 0x0F0F0F0Fu), (int)((w2 >> 4) & 0x0F0F0F0Fu)};
-    sacc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, Q.q[s], sacc, false);
-    sacc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a2, true, Q.q[s + 1], sacc2, false);
-  }
-  sacc += sacc2;
   float sc[8];
   float mx = -INFINITY;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     const int tt = h * 8 + i;
-    const uint32_t kbits = __float_as_uint(__shfl(R.ksp, tt, 32));
+    const uint32_t kbits = __float_as_uint(__shfl(ksp, tt, 32));
     const float ks = __uint_as_float(kbits & ~0xFu);
     const float kz = (float)(kbits & 0xFu);
-    float x = Q.qs * ks * ((float)sacc[i] - kz * Q.qsum);
+    float x = qsc * ks * ((float)sacc[i] - kz * qsum);
     const int kpos = tok0 + tt;
-    if (kpos >= seq_len || kpos > Q.qpos) x = -INFINITY;
+    if (kpos >= seq_len || kpos > qpos) x = -INFINITY;
     sc[i] = x;
     mx = fmaxf(mx, x);
   }
@@ -352,7 +343,7 @@ __device__ __forceinline__ void score_step(const QTile& Q, const TileRegs& R, in
   for (int i = 0; i < 8; ++i) {
     const float e = (m_new == -INFINITY) ? 0.f : exp2f(sc[i] - m_new);
     psum += e;
-    const uint32_t vbits = __float_as_uint(__shfl(R.vsp, h * 8 + i, 32));
+    const uint32_t vbits = __float_as_uint(__shfl(vsp, h * 8 + i, 32));
     const float ev = e * __uint_as_float(vbits & ~0xFu);
     pz += ev * (float)(vbits & 0xFu);
     p[i] = (_Float16)ev;
@@ -360,6 +351,22 @@ __device__ __forceinline__ void score_step(const QTile& Q, const TileRegs& R, in
   l = l * alpha + psum;
   corr = corr * alpha + pz;
   m = m_new;
+}
+
+// QK^T + online-softmax update for one 16-key tile; returns the probabilities p and the rescale factor alpha.
+__device__ __forceinline__ void score_step(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
+                                           float& m, float& l, float& corr, v8h& p, float& alpha) {
+  v8i sacc = {0, 0, 0, 0, 0, 0, 0, 0}, sacc2 = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+  for (int s = 0; s < 16; s += 2) {
+    const uint32_t w = R.kb[s >> 2][s & 3], w2 = R.kb[(s + 1) >> 2][(s + 1) & 3];
+    v2i a = {(int)(w & 0x0F0F0F0Fu), (int)((w >> 4) & 0x0F0F0F0Fu)};
+    v2i a2 = {(int)(w2 & 0x0F0F0F0Fu), (int)((w2 >> 4) & 0x0F0F0F0Fu)};
+    sacc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, Q.q[s], sacc, false);
+    sacc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a2, true, Q.q[s + 1], sacc2, false);
+  }
+  sacc += sacc2;
+  softmax_tile(Q.qs, Q.qsum, Q.qpos, sacc, R.ksp, R.vsp, tok0, seq_len, lane, m, l, corr, p, alpha);
 }
 
 __device__ __forceinline__ void compute_tile(const QTile& Q, const TileRegs& R, int tok0, int seq_len, int lane,
@@ -776,6 +783,189 @@ __global__ void __launch_bounds__(32 * WAVES) attn_prefill_lds_kernel(
   }
 }
 
+
+// ---------------------------------------------------------------------------------
+// Prefill variant 1 (BONSAI_PF_VARIANT=1, V3 only). Same per-wave math as attn_prefill_kernel (one 16-row q
+// tile per wave, no cross-wave reduction -> bit-exact) but the WG (W waves, consecutive q tiles of one
+// sequence) unpacks each 16-key tile ONCE into LDS in a compute-ready form: K as int8 pairs (iu8 WMMA
+// A operand, row stride padded to 272 B: conflict-free), V as fp16 V^T. Double-buffered: tile t+1 is
+// unpacked (from registers loaded one iteration earlier) while tile t is computed; one barrier per tile.
+#ifdef BONSAI_V3
+constexpr int PF3_KSTR = 34;  // K LDS row stride in v2i (32 words + 2 pad)
+
+// In-place 16-point FWHT over (i, h) of one lane's 8 values and its xor-16 partner.
+__device__ __forceinline__ void fwht16_lane(v8f& x, int h) {
+#pragma unroll
+  for (int b = 1; b < 8; b <<= 1)
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      if (!(i & b)) { float a = x[i], c = x[i | b]; x[i] = a + c; x[i | b] = a - c; }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float p = __shfl_xor(x[i], 16, 32);
+    x[i] = h ? (p - x[i]) : (x[i] + p);
+  }
+}
+
+// Scale two outputs by 1/16 and the RHT signs of dims d, d+1, convert to T and pack into one word.
+template <typename T>
+__device__ __forceinline__ uint32_t pack_out(float a, float b, int d) {
+  const uint16_t lo = __builtin_bit_cast(uint16_t, from_f<T>(a * 0.0625f * rht_sign(d)));
+  const uint16_t hi = __builtin_bit_cast(uint16_t, from_f<T>(b * 0.0625f * rht_sign(d + 1)));
+  return lo | ((uint32_t)hi << 16);
+}
+
+// Key tile count (exclusive) needed by rows [row0, row0 + n) of a sequence; 0 when no valid row.
+__device__ __forceinline__ int pf3_ntiles(int row0, int n, int qlen, int G, int seq_len) {
+  const int last_row = min(row0 + n - 1, qlen * G - 1);
+  return last_row < row0 ? 0 : ((seq_len - qlen + last_row / G + 16) >> 4);
+}
+
+// Normalize + inverse FWHT in place (same operation order as attn_prefill_kernel's epilogue).
+__device__ __forceinline__ void pf3_finish(v8f acc[16], float l, float corr, int h) {
+  l += __shfl_xor(l, 16, 32);
+  corr += __shfl_xor(corr, 16, 32);
+  const float inv = l > 0.f ? 1.f / l : 0.f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[j][i] = (acc[j][i] - corr) * inv;
+    fwht16_lane(acc[j], h);
+  }
+#pragma unroll
+  for (int b = 1; b < 16; b <<= 1)
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+      if (!(j & b)) { v8f a = acc[j], c = acc[j | b]; acc[j] = a + c; acc[j | b] = a - c; }
+}
+
+template <typename T>
+__device__ __forceinline__ void pf3_store(const v8f acc[16], T* dst, int h) {
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    uint32_t w[4];
+#pragma unroll
+    for (int i = 0; i < 8; i += 2) w[i >> 1] = pack_out<T>(acc[j][i], acc[j][i + 1], 16 * j + 8 * h + i);
+    *reinterpret_cast<uint4*>(dst + 16 * j + 8 * h) = uint4{w[0], w[1], w[2], w[3]};
+  }
+}
+
+template <typename T, int W>
+__global__ void __launch_bounds__(32 * W, 8 / (W / 4)) attn_prefill3_kernel(
+    const int8_t* __restrict__ q8, const float* __restrict__ qs, const int* __restrict__ qsum, int nqh,
+    const uint8_t* __restrict__ cache, int64_t s_blk, int64_t s_head, int64_t s_slot, int block_size,
+    const int* __restrict__ block_table, int bt_stride, const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc, const int* __restrict__ work, int G, T* __restrict__ out,
+    int64_t o_tok_stride, int64_t o_head_stride) {
+  static_assert(W == 4 || W == 8, "attn_prefill3_kernel: W = 4 or 8");
+  constexpr int UJ = 16 / W;  // V dim tiles unpacked per thread
+  __shared__ __align__(16) v2i k_lds[2][16 * PF3_KSTR];
+  __shared__ __align__(16) _Float16 vt_lds[2][256 * 16];  // V^T fp16: [dim][token]
+  __shared__ float ks_lds[2][16], vs_lds[2][16];          // packed scale+zp
+  __shared__ __align__(16) v2i q_lds[W * 16 * 32];        // [wave][step][lane]
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, r = lane & 15, h = lane >> 4;
+  const int kvh = blockIdx.y;
+  const int seq = work[blockIdx.x * 2], wg_row0 = work[blockIdx.x * 2 + 1], row0 = wg_row0 + wave * 16;
+  const int q0 = query_start_loc[seq], qlen = query_start_loc[seq + 1] - q0;
+  const int seq_len = seq_lens[seq];
+  const int row = row0 + r, qi = row / G;
+  const bool valid = row < qlen * G;
+  const int qtok = q0 + (valid ? qi : 0), qh = kvh * G + row % G;
+  {
+    const int8_t* qrow = q8 + ((int64_t)qtok * nqh + qh) * HD + h * 128;
+#pragma unroll
+    for (int s = 0; s < 16; ++s)
+      q_lds[(wave * 16 + s) * 32 + lane] = valid ? *reinterpret_cast<const v2i*>(qrow + s * 8) : v2i{0, 0};
+  }
+  const float qsc = valid ? qs[(int64_t)qtok * nqh + qh] : 0.f;
+  const float qsm = valid ? (float)qsum[(int64_t)qtok * nqh + qh] : 0.f;
+  const int qpos = valid ? (seq_len - qlen + qi) : -1;
+  const int my_nt = pf3_ntiles(row0, 16, qlen, G, seq_len);
+  const int blk_nt = pf3_ntiles(wg_row0, 16 * W, qlen, G, seq_len);
+  const int* btab = block_table + (int64_t)seq * bt_stride;
+  const uint8_t* cache_head = cache + (int64_t)kvh * s_head;
+
+  // Cooperative tile load. K: thread (< 128) -> token tid>>3, 16 B piece tid&7.
+  // V: thread -> (dl = tid & 15 = region, hh = (tid >> 4) & 1, jq = tid >> 5): dim tiles UJ*jq .. UJ*jq+UJ-1.
+  uint4 kreg = {0, 0, 0, 0};
+  uint2 va = {0, 0};
+  uint32_t vbw = 0;
+  float sreg = 0.f;
+  const int v_dl = tid & 15, v_hh = (tid >> 4) & 1, v_jq = tid >> 5;
+  auto gload = [&](int t) {
+    const int tok0 = t * 16;
+    const uint8_t* tile = cache_head + (int64_t)btab[tok0 / block_size] * s_blk + (int64_t)(tok0 % block_size) * s_slot;
+    if (tid < 128) kreg = *reinterpret_cast<const uint4*>(tile + (int64_t)(tid >> 3) * s_slot + KV_OFF_K + (tid & 7) * 16);
+    const uint8_t* vb = tile + (int64_t)v_dl * s_slot + KV_OFF_V + v_hh * V_LANE_BYTES;
+    if (W == 4) {
+      va = *reinterpret_cast<const uint2*>(vb + v_jq * 8);
+      vbw = *reinterpret_cast<const uint32_t*>(vb + 32 + v_jq * 4);
+    } else {
+      va.x = *reinterpret_cast<const uint32_t*>(vb + v_jq * 4);
+      vbw = *reinterpret_cast<const uint32_t*>(vb + 32 + (v_jq >> 1) * 4);
+    }
+    if (tid < 32) sreg = *reinterpret_cast<const float*>(tile + (int64_t)(tid & 15) * s_slot + ((tid < 16) ? KV_OFF_KS : KV_OFF_VS));
+  };
+  auto stage = [&](int b) {
+    if (tid < 128) {
+      const uint32_t wk[4] = {kreg.x, kreg.y, kreg.z, kreg.w};
+      v2i u[4];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) u[k] = v2i{(int)(wk[k] & 0x0F0F0F0Fu), (int)((wk[k] >> 4) & 0x0F0F0F0Fu)};
+      uint4* kd = reinterpret_cast<uint4*>(&k_lds[b][(tid >> 3) * PF3_KSTR + (tid & 7) * 4]);
+      kd[0] = uint4{(uint32_t)u[0][0], (uint32_t)u[0][1], (uint32_t)u[1][0], (uint32_t)u[1][1]};
+      kd[1] = uint4{(uint32_t)u[2][0], (uint32_t)u[2][1], (uint32_t)u[3][0], (uint32_t)u[3][1]};
+    }
+    if (tid < 16) ks_lds[b][tid] = sreg; else if (tid < 32) vs_lds[b][tid - 16] = sreg;
+#pragma unroll
+    for (int u = 0; u < UJ; ++u) {
+      const int j = UJ * v_jq + u;
+      const uint32_t A = (W == 4 ? ((u >> 1) ? va.y : va.x) >> (8 * (u & 1)) : va.x >> (8 * u));
+      const uint32_t B = vbw >> (W == 4 ? 4 * u : 4 * (j & 3));
+      *reinterpret_cast<v8h*>(&vt_lds[b][(16 * j + v_dl) * 16 + v_hh * 8]) = unpack_v3(A, B);
+    }
+  };
+  v8f acc[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+  float m = -INFINITY, l = 0.f, corr = 0.f;
+  if (blk_nt > 0) { gload(0); stage(0); if (blk_nt > 1) gload(1); }
+  __syncthreads();
+  for (int t = 0; t < blk_nt; ++t) {
+    const int b = t & 1;
+    if (t + 1 < blk_nt) { stage(b ^ 1); if (t + 2 < blk_nt) gload(t + 2); }
+    if (t < my_nt) {
+      v8i s0 = {0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
+      const v2i* kr = &k_lds[b][r * PF3_KSTR + h * 16];
+#pragma unroll
+      for (int s = 0; s < 16; s += 2) {
+        s0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, kr[s], true, q_lds[(wave * 16 + s) * 32 + lane], s0, false);
+        s1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, kr[s + 1], true, q_lds[(wave * 16 + s + 1) * 32 + lane], s1, false);
+        if ((s & 3) == 2) __builtin_amdgcn_sched_barrier(0);  // bound the K/Q reads in flight (VGPRs)
+      }
+      s0 += s1;
+      v8h p;
+      float alpha;
+      softmax_tile(qsc, qsm, qpos, s0, ks_lds[b][r], vs_lds[b][r], t * 16, seq_len, lane, m, l, corr, p, alpha);
+      if (__builtin_amdgcn_ballot_w32(alpha != 1.f)) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+#pragma unroll
+          for (int i = 0; i < 8; ++i) acc[j][i] *= alpha;
+      }
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const v8h a = *reinterpret_cast<const v8h*>(&vt_lds[b][(16 * j + r) * 16 + h * 8]);
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, p, acc[j]);
+      }
+    }
+    __syncthreads();
+  }
+  if (!valid) return;
+  pf3_finish(acc, l, corr, h);
+  pf3_store<T>(acc, out + (int64_t)qtok * o_tok_stride + (int64_t)qh * o_head_stride, h);
+}
+#endif
 
 // ---------------------------------------------------------------------------------
 // Small-M (M <= 16) ternary GEMM (byte-plane Q2 weights of ternary_fast.py): the WG splits K over
@@ -1582,17 +1772,29 @@ void attn_prefill(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch:
   const int nqh = q8.size(1), nkv = cache.size(1), G = nqh / nkv;
   auto stream = c10::hip::getCurrentHIPStream().stream();
   dim3 grid(nwork, nkv);
+  const int variant = [] { const char* v = std::getenv("BONSAI_PF_VARIANT"); return v ? std::atoi(v) : 0; }();  // read per call: tests toggle it in-process
+  // WG width of variant 1; the work items must hold 16 * pf_w rows (bonsai_int4_attn.PF_ROWS)
+  const int pf_w = [] { const char* v = std::getenv("BONSAI_PF_W"); return v ? std::atoi(v) : 4; }();
   static const bool use_lds = [] { const char* v = std::getenv("BONSAI_PREFILL_LDS"); return v && std::atoi(v) != 0; }();
 #define PF_ARGS(TT) \
       q8.data_ptr<int8_t>(), qs.data_ptr<float>(), qsum.data_ptr<int>(), nqh, cache.data_ptr<uint8_t>(), \
       cache.stride(0), cache.stride(1), cache.stride(2), cache.size(2), block_table.data_ptr<int>(), \
       block_table.stride(0), seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), work.data_ptr<int>(), G, \
       (TT*)out.data_ptr(), out.stride(0), out.stride(1)
+#ifdef BONSAI_V3
+#define PF3_LAUNCH(TT) \
+  if (pf_w == 8) {hipLaunchKernelGGL(( attn_prefill3_kernel<TT, 8>), dim3(grid), dim3(256), 0, stream, PF_ARGS(TT)); } \
+  else {hipLaunchKernelGGL(( attn_prefill3_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); }
+#else
+#define PF3_LAUNCH(TT) TORCH_CHECK(false, "BONSAI_PF_VARIANT=1 needs BONSAI_V3");
+#endif
 #define LAUNCH(TT) \
-  if (use_lds) {hipLaunchKernelGGL(( attn_prefill_lds_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); } \
+  if (variant == 1) { PF3_LAUNCH(TT) } \
+  else if (use_lds) {hipLaunchKernelGGL(( attn_prefill_lds_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); } \
   else {hipLaunchKernelGGL(( attn_prefill_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); }
   if (out.scalar_type() == at::kHalf) { LAUNCH(__half) } else { LAUNCH(__hip_bfloat16) }
 #undef LAUNCH
+#undef PF3_LAUNCH
 #undef PF_ARGS
 }
 

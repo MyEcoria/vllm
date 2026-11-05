@@ -20,7 +20,9 @@ DEC_MAX = int(os.environ.get("BONSAI_INT4_DEC_MAX", "5"))
 V3 = os.environ.get("BONSAI_KV_V3", "1") == "1"
 CONTENT_BYTES = 232 if V3 else 264
 NUM_SPLITS = int(os.environ.get("BONSAI_INT4_SPLITS", "32"))
-PF_ROWS = 64  # rows per prefill work item (4 waves x 16)
+PF_VARIANT = os.environ.get("BONSAI_PF_VARIANT", "0")
+PF_W = int(os.environ.get("BONSAI_PF_W", "4"))  # waves per prefill WG of variant 1 (4 or 8)
+PF_ROWS = 16 * (PF_W if PF_VARIANT == "1" else 4)  # rows per prefill work item (waves x 16)
 SPLIT_CAP = int(os.environ.get("BONSAI_INT4_SPLIT_CAP", "1024"))
 CHUNK_SPLITK_MAX = int(os.environ.get("BONSAI_CHUNK_SPLITK_MAX", "256"))
 OVERLAP = os.environ.get("BONSAI_ATTN_OVERLAP", "1") == "1"
