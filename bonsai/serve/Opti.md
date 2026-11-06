@@ -687,3 +687,10 @@ avec `git add -f`.
 1. Attention plus rapide : P·V fp16 et softmax dominent. Ordonnancer WMMA et exp entre waves, façon « ping-pong » de FA3.
 2. Sélection parcimonieuse plus fine : une borne moins lâche que les boîtes min/max.
 3. Cache de préfixe pour les tours d'agents (§10).
+
+### 13.x Défaut (2026-11-06)
+
+`bonsai launch` active maintenant `--sparse-prefill 0.9` par défaut avec `--kv int4` (le défaut).
+`--no-sparse-prefill` revient à l'attention de prefill dense (sans perte). Pas d'activation avec
+`--kv fp8`/`bf16`, ni si `BONSAI_PF_VARIANT=1` ou `BONSAI_SPARSE_PREFILL` viennent déjà de l'environnement.
+Vérifié après le changement : greedy 1,000, needle 4/4.

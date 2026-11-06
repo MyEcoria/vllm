@@ -30,7 +30,8 @@ Other options (all of them: bonsai launch --help):
     --decode-deadline-ms MS   cap the predicted time of each step at MS ms, so prefill never stalls decodes (default off)
     --kv-evict off|lag|kvzip  KV cache eviction, passed as BONSAI_KV_EVICT (default off); --kv-evict-ratio R (> 1, default 2)
                               goes to BONSAI_KV_EVICT_RATIO
-    --sparse-prefill TAU      opt-in, lossy, needs --kv int4: BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] (default off).
+    --sparse-prefill TAU      lossy, --kv int4 only: BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] (default 0.9);
+                              --no-sparse-prefill for dense (lossless) prefill attention.
                               Measured at 0.9: solo 99k prefill
                               1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each (TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110;
                               needle 4/4. Applies to the 16 full-attention layers when the context before the chunk is >= 16384 tokens
@@ -92,6 +93,8 @@ INT4_BLOCK_BYTES = 17 * INT4_BLOCK_TOKENS * 928
 GPU_MEMORY = 0.95
 # --share-prefill: concurrent prompts each get this many prompt tokens per step (max-num-batched-tokens // max-num-seqs).
 SHARE_PREFILL_BATCH_TOKENS = 512
+# default sparse-prefill coverage with --kv int4 (Opti.md §13: +14-19% prefill, long NLL +0.5%, needle 4/4)
+SPARSE_PREFILL_DEFAULT = 0.9
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
@@ -497,11 +500,12 @@ def main() -> int:
     l.add_argument("--kv-evict-ratio", type=parse_above_one, default=2.0, metavar="R",
                    help="KV eviction ratio, above 1, passed as BONSAI_KV_EVICT_RATIO (default 2; used only with --kv-evict)")
     l.add_argument("--sparse-prefill", type=parse_tau, default=None, metavar="TAU",
-                   help="opt-in, lossy, needs --kv int4: sparse prefill, passed as BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] "
-                        "(default off). "
+                   help="lossy sparse prefill for --kv int4, passed as BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] "
+                        f"(default {SPARSE_PREFILL_DEFAULT} with --kv int4; --no-sparse-prefill turns it off). "
                         "Measured at 0.9: solo 99k prefill 1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each "
                         "(TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110; needle 4/4. Applies to the 16 full-attention "
                         "layers when the context before the chunk is >= 16384 tokens")
+    l.add_argument("--no-sparse-prefill", action="store_true", help="dense prefill attention (lossless)")
     l.add_argument("--sparse-min-chunk", type=parse_min_chunk, default=None, metavar="N",
                    help="passed as BONSAI_SPARSE_MIN_CHUNK, N >= 1 (default unset)")
     l.add_argument("--spec-tokens", type=int, default=3, metavar="K", help="MTP draft tokens per step (default 3)")
@@ -519,6 +523,12 @@ def main() -> int:
     a = p.parse_args()
     if a.sparse_prefill is not None and a.kv != "int4":
         l.error("--sparse-prefill needs --kv int4")
+    if a.no_sparse_prefill:
+        if a.sparse_prefill is not None:
+            l.error("--sparse-prefill and --no-sparse-prefill are exclusive")
+    elif a.sparse_prefill is None and a.kv == "int4" and not os.environ.get("BONSAI_SPARSE_PREFILL") \
+            and os.environ.get("BONSAI_PF_VARIANT", "0").strip() in ("", "0"):
+        a.sparse_prefill = SPARSE_PREFILL_DEFAULT
     return cmd_launch(a)
 
 
