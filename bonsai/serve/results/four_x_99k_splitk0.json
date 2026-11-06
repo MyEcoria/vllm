@@ -1,0 +1,54 @@
+{
+ "results": [
+  {
+   "agent": 3,
+   "turn": 1,
+   "cached": 0,
+   "ttft": 367.42215737899824,
+   "prompt_tokens": 99558,
+   "delta": 99558,
+   "prefill_tps": 270.96351703499823,
+   "generated": 442,
+   "decode_tps": 69.94960740341527,
+   "min_window_tps": 69.26865671641791
+  },
+  {
+   "agent": 1,
+   "turn": 1,
+   "cached": 0,
+   "ttft": 358.4496022599924,
+   "prompt_tokens": 98820,
+   "delta": 98820,
+   "prefill_tps": 275.68729153819345,
+   "generated": 900,
+   "decode_tps": 53.88412601187077,
+   "min_window_tps": 21.51394422310757
+  },
+  {
+   "agent": 2,
+   "turn": 1,
+   "cached": 0,
+   "ttft": 363.68218449999404,
+   "prompt_tokens": 98683,
+   "delta": 98683,
+   "prefill_tps": 271.3440586474524,
+   "generated": 900,
+   "decode_tps": 71.38617151383536,
+   "min_window_tps": 37.5
+  },
+  {
+   "agent": 0,
+   "turn": 1,
+   "cached": 0,
+   "ttft": 365.5325883780024,
+   "prompt_tokens": 99050,
+   "delta": 99050,
+   "prefill_tps": 270.9744716319821,
+   "generated": 900,
+   "decode_tps": 78.44312529304038,
+   "min_window_tps": 47.950819672131146
+  }
+ ],
+ "errors": [],
+ "hit_rate": 0.0
+}

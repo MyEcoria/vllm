@@ -30,6 +30,10 @@ Other options (all of them: bonsai launch --help):
     --decode-deadline-ms MS   cap the predicted time of each step at MS ms, so prefill never stalls decodes (default off)
     --kv-evict off|lag|kvzip  KV cache eviction, passed as BONSAI_KV_EVICT (default off); --kv-evict-ratio R (> 1, default 2)
                               goes to BONSAI_KV_EVICT_RATIO
+    --sparse-prefill TAU      opt-in, lossy: BONSAI_SPARSE_PREFILL, TAU in (0, 1] (default off). Measured at 0.9: solo 99k prefill
+                              1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each (TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110;
+                              needle 4/4. Applies to the 16 full-attention layers when the context before the chunk is >= 16384 tokens
+    --sparse-min-chunk N      BONSAI_SPARSE_MIN_CHUNK, N >= 1 (default unset)
     --host ADDR, --port N, --api-key-env NAME, --no-api-key
 
 Everything it writes (the log, the pid, the key) goes to ~/.bonsai (or $BONSAI_HOME).
@@ -190,7 +194,8 @@ def api_key(a, data: Path, create: bool) -> str | None:
     return key
 
 
-PLAN_ENV = ("GPU_MAX_HW_QUEUES", "VLLM_GGUF_DRAFT_VOCAB_ON_CPU", "BONSAI_KV_EVICT", "BONSAI_KV_EVICT_RATIO")
+PLAN_ENV = ("GPU_MAX_HW_QUEUES", "VLLM_GGUF_DRAFT_VOCAB_ON_CPU", "BONSAI_KV_EVICT", "BONSAI_KV_EVICT_RATIO",
+            "BONSAI_SPARSE_PREFILL", "BONSAI_SPARSE_MIN_CHUNK")
 
 
 def parse_above_one(text: str) -> float:
@@ -206,6 +211,22 @@ def parse_positive_ms(text: str) -> float:
     value = float(text)
     if not 0 < value < float("inf"):
         raise argparse.ArgumentTypeError(f"must be a positive number of milliseconds, not {text!r}")
+    return value
+
+
+def parse_tau(text: str) -> float:
+    """argparse type: a finite float greater than 0 and at most 1."""
+    value = float(text)
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"must be above 0 and at most 1, not {text!r}")
+    return value
+
+
+def parse_min_chunk(text: str) -> int:
+    """argparse type: an integer of at least 1."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {text!r}")
     return value
 
 
@@ -233,6 +254,10 @@ def server_env(a) -> dict[str, str]:
     if a.kv_evict != "off":
         env["BONSAI_KV_EVICT"] = a.kv_evict
         env["BONSAI_KV_EVICT_RATIO"] = str(a.kv_evict_ratio)
+    if a.sparse_prefill is not None:
+        env["BONSAI_SPARSE_PREFILL"] = str(a.sparse_prefill)
+    if a.sparse_min_chunk is not None:
+        env["BONSAI_SPARSE_MIN_CHUNK"] = str(a.sparse_min_chunk)
     return env
 
 
@@ -445,6 +470,13 @@ def main() -> int:
                    help="KV cache eviction mode, passed as BONSAI_KV_EVICT (default off)")
     l.add_argument("--kv-evict-ratio", type=parse_above_one, default=2.0, metavar="R",
                    help="KV eviction ratio, above 1, passed as BONSAI_KV_EVICT_RATIO (default 2; used only with --kv-evict)")
+    l.add_argument("--sparse-prefill", type=parse_tau, default=None, metavar="TAU",
+                   help="opt-in, lossy: sparse prefill, passed as BONSAI_SPARSE_PREFILL, TAU in (0, 1] (default off). "
+                        "Measured at 0.9: solo 99k prefill 1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each "
+                        "(TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110; needle 4/4. Applies to the 16 full-attention "
+                        "layers when the context before the chunk is >= 16384 tokens")
+    l.add_argument("--sparse-min-chunk", type=parse_min_chunk, default=None, metavar="N",
+                   help="passed as BONSAI_SPARSE_MIN_CHUNK, N >= 1 (default unset)")
     l.add_argument("--spec-tokens", type=int, default=3, metavar="K", help="MTP draft tokens per step (default 3)")
     l.add_argument("--vllm-arg", dest="vllm_args", action="append", metavar="ARG",
                    help="extra argument passed to vllm serve (repeatable)")

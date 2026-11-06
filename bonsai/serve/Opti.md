@@ -630,3 +630,60 @@ chaque lecture des poids (Sarathi 2308.16369, Dynamic SplitFuse 2401.08671).
 | Décodage ensuite | 20,7 à 106 t/s | 54 à 81 t/s (moy. 71,5) |
 
 Résultats : `results/four_x_99k.json` (un par un), `results/four_x_99k_lpt128.json` (partagé).
+
+## 13. Prefill (2026-11-06)
+
+But : accélérer le prefill partagé de 4 × 99k (§12.7) sans perte de qualité. Commits F0 (`1bb902ea78`,
+mesures) et F1 (`b75b68e5b4`, noyau optionnel) sur `feat/gdn-step-cache`. Les chiffres de §13.4 et les
+essais de §13.2 viennent des mesures de la session, pas des seuls commits.
+
+### 13.1 Où part le temps
+- `tools/prefill_opbench.py` (T = 512 nouveaux tokens, profondeur 50k) : attention 46 %, GEMM ternaire 48 %, GDN 6 %.
+- Profil d'un prefill seul de 99k (`tools/step_profile.py --prefill`) : GPU occupé à 98 % (2 % d'inactivité),
+  donc limité par le calcul et non par le CPU. Par token : attention 0,47-0,54 ms (croît avec la profondeur),
+  GEMM 0,38 ms, le reste moins de 0,07 ms.
+
+### 13.2 Pistes testées
+
+| Piste | Résultat | Verdict |
+|---|---|---|
+| Morceaux de 1024 tokens | +2 % (295 t/s chacun) | Gain trop faible |
+| Morceaux de 2048 et 4096 | OOM à côté du pool KV de 424k | Refusés, 512 gardé |
+| F1 : noyau d'attention partagé par workgroup (`BONSAI_PF_VARIANT=1`, `BONSAI_PF_W=8`) | Bit-exact ; −10 % à T = 2048, nul à T = 512 | Gardé, optionnel, désactivé par défaut |
+| F2 : GEMM pour grands M | Bit-exact mais 0,90-0,95× ; limité par l'épilogue d'échelle par groupe de 128 du Q2_0 (~27 %) ; plafond int8 212 TOPS | Retiré |
+| F3 : coût CPU | Le GPU est le facteur limitant | Non fait |
+| F4 : GDN / MTP | 6 % du temps, une couche sur 64 seulement | Non fait |
+| Morceaux de 128 routés vers `attn_prefill` (`BONSAI_PF_SPLITK_MAX=0`) | 272 contre 290 t/s | Plus lent, seuil actuel gardé |
+| Softmax rapide FA3/FA4 | Erreur 9e-4, aucun gain | Retiré |
+| P·V en int8 | Plus lent | Retiré |
+| Mesure par étapes de l'attention | P·V ~45 %, softmax ~33 %, décompression ~0 en prefill et ~20 % en split-K | Instrumentation retirée |
+
+### 13.3 Gain sans perte
+Le noyau d'attention dense passe désormais par le chemin à liste de blocs, qui déborde moins les registres.
+Une couche à 100k passe de 28,4 à 23,5 ms (micro-benchmark), soit +1 % de bout en bout (1080 → 1089-1092 t/s).
+
+### 13.4 Option à perte : `--sparse-prefill TAU`
+- Pour chaque bloc de 128 tokens de K, on garde une boîte min/max. Les blocs sont sélectionnés jusqu'à couvrir
+  la part tau du score, avec un puits de 2048 tokens au début et une fenêtre locale de 4096 tokens.
+- Active à partir de 16 384 tokens de contexte, pour le prefill et le split-K. Réglages : `BONSAI_SPARSE_PREFILL`,
+  `BONSAI_SPARSE_MIN_CHUNK`, `BONSAI_SPARSE_STATS`. Sans `--sparse-prefill`, rien ne change.
+- Résultats à tau 0,9 :
+
+| Mesure | Sans | Avec tau 0,9 |
+|---|---|---|
+| Prefill seul | 1089 t/s | 1294 t/s |
+| 4 × 99k partagé | 292 t/s chacun | 332 t/s chacun |
+| Premier token (4 × 99k) | 340 s | 298 s |
+| Décodage | 70,6 t/s | 66,2 t/s |
+| NLL longue (95k) | 0,7073 | 0,7110 (+0,5 %) |
+| Aiguille / greedy | — | 4/4 / 1,000 |
+
+### 13.5 Piège
+`csrc/int4attn/int4_attn.hip` était ignoré par la règle `*.hip` du `.gitignore` : seule la copie générée
+`int4_attn_hip.hip` était versionnée, alors que c'est le source compilé à la volée. Corrigé en l'ajoutant
+avec `git add -f`.
+
+### 13.6 Pistes suivantes
+1. Attention plus rapide : P·V fp16 et softmax dominent. Ordonnancer WMMA et exp entre waves, façon « ping-pong » de FA3.
+2. Sélection parcimonieuse plus fine : une borne moins lâche que les boîtes min/max.
+3. Cache de préfixe pour les tours d'agents (§10).

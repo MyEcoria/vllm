@@ -15,6 +15,15 @@ from pathlib import Path
 
 import torch
 
+
+def _nonneg_env(name, default):
+    """Read an int env var at import time and reject negative values."""
+    value = int(os.environ.get(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
 DEC_MAX = int(os.environ.get("BONSAI_INT4_DEC_MAX", "5"))
 # K 4-bit + V 3-bit (MSE-clipped): 232 B per (token, kv head) instead of 264
 V3 = os.environ.get("BONSAI_KV_V3", "1") == "1"
@@ -22,9 +31,13 @@ CONTENT_BYTES = 232 if V3 else 264
 NUM_SPLITS = int(os.environ.get("BONSAI_INT4_SPLITS", "32"))
 PF_VARIANT = os.environ.get("BONSAI_PF_VARIANT", "0")
 PF_W = int(os.environ.get("BONSAI_PF_W", "4"))  # waves per prefill WG of variant 1 (4 or 8)
+# Opt-in lossy block-sparse prefill (read by the kernel host code per call): BONSAI_SPARSE_PREFILL=tau (softmax
+# coverage, e.g. 0.95; unset = dense), BONSAI_SPARSE_SINK / _LOCAL (tokens always kept, 2048 / 4096),
+# BONSAI_SPARSE_MIN_CTX (context before the chunk from which it applies, 16384), BONSAI_SPARSE_MIN_CHUNK (shortest
+# chunk, 128; applies to the split-K chunk kernel too). Needs BONSAI_PF_VARIANT=0.
 PF_ROWS = 16 * (PF_W if PF_VARIANT == "1" else 4)  # rows per prefill work item (waves x 16)
 SPLIT_CAP = int(os.environ.get("BONSAI_INT4_SPLIT_CAP", "1024"))
-CHUNK_SPLITK_MAX = int(os.environ.get("BONSAI_CHUNK_SPLITK_MAX", "256"))
+PF_SPLITK_MAX = _nonneg_env("BONSAI_PF_SPLITK_MAX", 256)  # prefill chunks <= this use split-K (0 = never)
 OVERLAP = os.environ.get("BONSAI_ATTN_OVERLAP", "1") == "1"
 
 _ext = None
@@ -146,7 +159,7 @@ def _prepare(md, common):
         if ql <= DEC_MAX:
             dec.append(s)
             max_dec = max(max_dec, ql)
-        elif ql <= CHUNK_SPLITK_MAX:
+        elif ql <= PF_SPLITK_MAX:
             # small prefill chunk mixed with decodes: the split-K kernel keeps the GPU busy
             chunk.append(s)
             max_chunk = max(max_chunk, ql)
@@ -232,10 +245,10 @@ def patch():
                   attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
             co, cml, csplits = _S.chunk_bufs(chunk_ids.shape[0], nkv, chunk_qtiles, query.device)
             e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                  attn_metadata.query_start_loc, chunk_ids, chunk_qtiles, csplits, co, cml, out)
+                  attn_metadata.query_start_loc, chunk_ids, chunk_qtiles, csplits, co, cml, out, attn_metadata.max_seq_len)
             if work is not None:
                 e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                               attn_metadata.query_start_loc, work, out)
+                               attn_metadata.query_start_loc, work, out, attn_metadata.max_seq_len)
             if has_dec and OVERLAP:
                 main.wait_stream(side)
             return output
@@ -250,7 +263,7 @@ def patch():
                 e.attn_decode(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
                   attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
             e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                           attn_metadata.query_start_loc, work, out)
+                           attn_metadata.query_start_loc, work, out, attn_metadata.max_seq_len)
             main.wait_stream(side)
             return output
         if has_dec:
@@ -259,7 +272,7 @@ def patch():
                   attn_metadata.query_start_loc, dec_ids, qtiles, splits, po, pml, out)
         if work is not None:
             e.attn_prefill(q8, qs, qsum, cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                           attn_metadata.query_start_loc, work, out)
+                           attn_metadata.query_start_loc, work, out, attn_metadata.max_seq_len)
         return output
 
     impl.forward = forward

@@ -1,9 +1,22 @@
 """Unit tests for the pure parts of quality.py (no server)."""
 import math
+import urllib.error
 
 import pytest
 
 import quality
+
+
+def fake_server(monkeypatch, down=False):
+    """Patch post_json with a whitespace tokenizer (one word is one token)."""
+    def post(url, headers, body):
+        if down:
+            raise urllib.error.URLError("server down")
+        if url.endswith("/tokenize"):
+            words = body["prompt"].split()
+            return {"count": len(words), "tokens": words}
+        return {"prompt": " ".join(body["tokens"])}
+    monkeypatch.setattr(quality, "post_json", post)
 
 
 def test_token_logprobs_skips_first_none():
@@ -96,3 +109,34 @@ def test_fit_text_and_json_after_subcommand():
     assert a.json_path == "o.json"
     assert quality.parse_args(["--json", "p.json", "nll"]).json_path == "p.json"
     assert quality.parse_args(["nll"]).json_path is None
+
+
+def test_trim_nll_text_cuts_to_exact_token_budget(monkeypatch):
+    """Long text is cut to the budget via /tokenize + /detokenize, not sent whole."""
+    fake_server(monkeypatch)
+    text = " ".join(f"w{i}" for i in range(1000))
+    args = quality.parse_args(["nll"])
+    assert quality.trim_nll_text(args, {}, text, 100) == " ".join(text.split()[:100])
+
+
+def test_trim_nll_text_keeps_short_text(monkeypatch):
+    """Text already within the budget is returned unchanged."""
+    fake_server(monkeypatch)
+    args = quality.parse_args(["nll"])
+    assert quality.trim_nll_text(args, {}, "a b c", 100) == "a b c"
+
+
+def test_trim_nll_text_chars_fallback_with_margin(monkeypatch):
+    """Without a server tokenizer, chars/4 is used with a 5% margin."""
+    fake_server(monkeypatch, down=True)
+    args = quality.parse_args(["nll"])
+    assert len(quality.trim_nll_text(args, {}, "x" * 10000, 100)) == 380
+
+
+def test_nll_budget_keeps_headroom_below_max_context():
+    """The prompt budget stays 64 tokens below --max-context."""
+    big = quality.parse_args(["nll", "--tokens", "200000"])
+    assert quality.nll_budget(big) == 100000 - 64
+    small = quality.parse_args(["nll", "--tokens", "500"])
+    assert quality.nll_budget(small) == 500
+    assert quality.nll_budget(quality.parse_args(["nll"])) == 100000 - 64

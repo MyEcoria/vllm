@@ -411,12 +411,16 @@ __device__ __forceinline__ void attn_tiles(const QTile& Q, const uint8_t* __rest
 // ---------------------------------------------------------------------------------
 // Decode / short-query split-K kernel. grid = (num_splits, nkv * qtiles, num_seqs), 32 threads.
 // Partial outputs: part_o [seq, nkv, qtile, split, 16 rows, 256] f32, part_ml [.., 16, 2]
+// SPARSE (BONSAI_SPARSE_PREFILL, chunk path): the split iterates its share of the kept 128-key blocks of the
+// q-tile's 64-row item (blist[((si * items + qt / 4) * nkv + kvh) * (nbmax + 1)], last entry = count).
+template <bool SPARSE>
 __global__ void __launch_bounds__(32) attn_decode_kernel(
     const int8_t* __restrict__ q8, const float* __restrict__ qs, const int* __restrict__ qsum, int nqh,
     const uint8_t* __restrict__ cache, int64_t s_blk, int64_t s_head, int64_t s_slot, int block_size,
     const int* __restrict__ block_table, int bt_stride, const int* __restrict__ seq_lens,
     const int* __restrict__ query_start_loc, const int* __restrict__ seq_ids, int G, int qtiles,
-    float* __restrict__ part_o, float* __restrict__ part_ml, int num_splits) {
+    float* __restrict__ part_o, float* __restrict__ part_ml, int num_splits, const int* __restrict__ blist,
+    int nbmax) {
   // grid = (nkv * qtiles, num_splits, nseq): the q tiles of one (head, split) are launched together so
   // their K/V reads are served by the L2 (a long query has many q tiles over the same keys)
   const int split = blockIdx.y, nkv = gridDim.x / qtiles;
@@ -450,9 +454,23 @@ __global__ void __launch_bounds__(32) attn_decode_kernel(
 #pragma unroll
   for (int j = 0; j < 16; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
   float m = -INFINITY, l = 0.f, corr = 0.f;
-  if (tb < te)
-    attn_tiles(Q, cache + (int64_t)kvh * s_head, block_table + (int64_t)seq * bt_stride, block_size, s_blk, s_slot,
-               tb, te, seq_len, lane, acc, m, l, corr);
+  const uint8_t* cache_head = cache + (int64_t)kvh * s_head;
+  const int* btab = block_table + (int64_t)seq * bt_stride;
+  if constexpr (SPARSE) {
+    const int items = (qtiles + 3) / 4;
+    const int* bl = blist + (((int64_t)si * items + qt / 4) * nkv + kvh) * (nbmax + 1);
+    const int n = bl[nbmax], sper = (n + num_splits - 1) / num_splits;
+    const int i1 = min(n, split * sper + sper);
+    for (int i = split * sper; i < i1;) {
+      int e = i + 1;
+      while (e < i1 && bl[e] == bl[e - 1] + 1) ++e;
+      const int t0 = bl[i] * 8, t1 = min(bl[e - 1] * 8 + 8, ntiles);
+      if (t0 < t1) attn_tiles(Q, cache_head, btab, block_size, s_blk, s_slot, t0, t1, seq_len, lane, acc, m, l, corr);
+      i = e;
+    }
+  } else if (tb < te) {
+    attn_tiles(Q, cache_head, btab, block_size, s_blk, s_slot, tb, te, seq_len, lane, acc, m, l, corr);
+  }
   // combine the two half-lanes' l and corr (each lane holds 8 of the 16 tokens per tile)
   l += __shfl_xor(l, 16, 32);
   corr += __shfl_xor(corr, 16, 32);
@@ -512,13 +530,16 @@ __global__ void __launch_bounds__(32) attn_reduce_kernel(const float* __restrict
 // Prefill (long query) kernel. One wave = one 16-row q tile; WG = WAVES waves.
 // work[i] = (seq, first_row) for WG i; rows of one kv head; grid = (num_work, nkv).
 // Output is normalized, inverse-rotated and written directly.
+// blist (BONSAI_SPARSE_PREFILL): iterates only over the 128-key blocks listed (ascending, -1 padded) in
+// blist[(work_idx * nkv + kvh) * (nbmax + 1) ...]; nullptr = all tiles. Consecutive blocks are merged into one run, so
+// a full list is bit-identical to the dense loop.
 template <typename T, int WAVES>
 __global__ void __launch_bounds__(32 * WAVES) attn_prefill_kernel(
     const int8_t* __restrict__ q8, const float* __restrict__ qs, const int* __restrict__ qsum, int nqh,
     const uint8_t* __restrict__ cache, int64_t s_blk, int64_t s_head, int64_t s_slot, int block_size,
     const int* __restrict__ block_table, int bt_stride, const int* __restrict__ seq_lens,
     const int* __restrict__ query_start_loc, const int* __restrict__ work, int G, T* __restrict__ out,
-    int64_t o_tok_stride, int64_t o_head_stride) {
+    int64_t o_tok_stride, int64_t o_head_stride, const int* __restrict__ blist, int nbmax) {
   const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane & 15, h = lane >> 4;
   const int kvh = blockIdx.y;
   const int seq = work[blockIdx.x * 2], row0 = work[blockIdx.x * 2 + 1] + wave * 16;
@@ -547,8 +568,24 @@ __global__ void __launch_bounds__(32 * WAVES) attn_prefill_kernel(
 #pragma unroll
   for (int j = 0; j < 16; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
   float m = -INFINITY, l = 0.f, corr = 0.f;
-  attn_tiles(Q, cache + (int64_t)kvh * s_head, block_table + (int64_t)seq * bt_stride, block_size, s_blk, s_slot, 0,
-             ntiles, seq_len, lane, acc, m, l, corr);
+  const uint8_t* cache_head = cache + (int64_t)kvh * s_head;
+  const int* btab = block_table + (int64_t)seq * bt_stride;
+  // runs of consecutive kept blocks (blist == nullptr: one run over all tiles = dense)
+  const int* bl = blist ? blist + ((int64_t)blockIdx.x * gridDim.y + kvh) * (nbmax + 1) : nullptr;
+  for (int i = 0;;) {
+    int t0 = 0, t1 = ntiles, e = nbmax;
+    if (bl) {
+      if (i >= nbmax || bl[i] < 0) break;
+      e = i + 1;
+      while (e < nbmax && bl[e] == bl[e - 1] + 1) ++e;
+      t0 = bl[i] * 8;
+      t1 = min(bl[e - 1] * 8 + 8, ntiles);
+      if (t0 >= ntiles) break;
+    }
+    attn_tiles(Q, cache_head, btab, block_size, s_blk, s_slot, t0, t1, seq_len, lane, acc, m, l, corr);
+    if (!bl) break;
+    i = e;
+  }
   l += __shfl_xor(l, 16, 32);
   corr += __shfl_xor(corr, 16, 32);
   const float inv = l > 0.f ? 1.f / l : 0.f;
@@ -590,6 +627,150 @@ __global__ void __launch_bounds__(32 * WAVES) attn_prefill_kernel(
       vals[i] = from_f<T>(x[j][i] * 0.0625f * rht_sign(d));
     }
     *reinterpret_cast<uint4*>(dst + 16 * j + 8 * h) = *reinterpret_cast<uint4*>(vals);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+// Block-sparse prefill (opt-in, lossy; BONSAI_SPARSE_PREFILL=tau). Blocks are SP_BLK = 128 keys.
+// 1) sparse_kbox_kernel: per (128-key block, kv head, seq) the per-dim min/max of the dequantized K, stored as
+//    center / radius, layout [seq][kvh][dim][nbmax] (blocks contiguous). One wave per block, K read once.
+#define SP_BLK 128
+#define SP_NBMAX 4096
+
+__global__ void __launch_bounds__(32) sparse_kbox_kernel(
+    const uint8_t* __restrict__ cache, int64_t s_blk, int64_t s_head, int64_t s_slot, int block_size,
+    const int* __restrict__ block_table, int bt_stride, const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc, int nkv, int nbmax, int min_ctx, int min_qlen,
+    float* __restrict__ kc, float* __restrict__ kr) {
+  const int b = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z, lane = threadIdx.x;
+  const int qlen = query_start_loc[seq + 1] - query_start_loc[seq], seq_len = seq_lens[seq];
+  if (qlen < min_qlen || seq_len - qlen < min_ctx || b * SP_BLK >= seq_len) return;
+  const int* btab = block_table + (int64_t)seq * bt_stride;
+  const uint8_t* head = cache + (int64_t)kvh * s_head;
+  float mn[8], mx[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) { mn[k] = INFINITY; mx[k] = -INFINITY; }
+  const int t_end = min(b * SP_BLK + SP_BLK, seq_len);
+  for (int t = b * SP_BLK; t < t_end; ++t) {
+    const uint8_t* row = head + (int64_t)btab[t / block_size] * s_blk + (int64_t)(t % block_size) * s_slot;
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(row + KV_OFF_K + lane * 4);
+    const uint32_t kb = *reinterpret_cast<const uint32_t*>(row + KV_OFF_KS);
+    const float ks = __uint_as_float(kb & ~0xFu), kz = (float)(kb & 0xFu);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const float x = ks * ((float)((w >> (4 * k)) & 0xFu) - kz);
+      mn[k] = fminf(mn[k], x);
+      mx[k] = fmaxf(mx[k], x);
+    }
+  }
+  const int64_t base = ((int64_t)seq * nkv + kvh) * HD;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    kc[(base + lane * 8 + k) * nbmax + b] = 0.5f * (mx[k] + mn[k]);
+    kr[(base + lane * 8 + k) * nbmax + b] = 0.5f * (mx[k] - mn[k]);
+  }
+}
+
+// 2) sparse_select_kernel: one wave per (work item, kv head). Block score = mean over the item's rows of the
+//    per-row box upper bound of q.k  = mean(q).center + mean(|q|).radius (exact for the mean). Softmax over
+//    the causally allowed blocks, then keep sink / local blocks plus the heaviest blocks until the softmax mass
+//    reaches tau (threshold found by bisection). Writes the kept block ids ascending, -1 padded.
+__device__ __forceinline__ void sparse_item_query(const int8_t* __restrict__ q8, const float* __restrict__ qs, int nqh,
+                                                  int q0, int row0, int nrows, int G, int kvh, int lane,
+                                                  float* qm, float* qa) {
+  float sm[8], sa[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) { sm[k] = 0.f; sa[k] = 0.f; }
+  for (int i = 0; i < 64; ++i) {
+    const int row = row0 + i;
+    if (i >= nrows) break;
+    const int64_t qrow = (int64_t)(q0 + row / G) * nqh + kvh * G + row % G;
+    const int8_t* src = q8 + qrow * HD + (lane >> 4) * 128 + (lane & 15) * 8;
+    const float s = qs[qrow];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const float v = (float)src[(k >> 1) + 4 * (k & 1)] * s;
+      sm[k] += v;
+      sa[k] += fabsf(v);
+    }
+  }
+  const float inv = 1.f / (float)max(nrows, 1);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) { qm[lane * 8 + k] = sm[k] * inv; qa[lane * 8 + k] = sa[k] * inv; }
+}
+
+__device__ __forceinline__ float wave_sum_f(float x) {
+#pragma unroll
+  for (int b = 16; b; b >>= 1) x += __shfl_xor(x, b, 32);
+  return x;
+}
+
+__global__ void __launch_bounds__(32) sparse_select_kernel(
+    const int8_t* __restrict__ q8, const float* __restrict__ qs, int nqh, const float* __restrict__ kc,
+    const float* __restrict__ kr, const int* __restrict__ seq_lens, const int* __restrict__ query_start_loc,
+    const int* __restrict__ work, const int* __restrict__ seq_ids, int G, int nbmax, float tau, int sink, int local,
+    int min_ctx, int min_chunk, int* __restrict__ blist) {
+  // work != nullptr: item = work[blockIdx.x] = (seq, first row); else item blockIdx.x of sequence seq_ids[blockIdx.z]
+  // (split-K chunk path). List width is nbmax + 1: the last entry holds the number of kept blocks.
+  const int lane = threadIdx.x, kvh = blockIdx.y, nkv = gridDim.y;
+  const int seq = work ? work[blockIdx.x * 2] : seq_ids[blockIdx.z];
+  const int row0 = work ? work[blockIdx.x * 2 + 1] : blockIdx.x * 64;
+  const int item = work ? blockIdx.x : blockIdx.z * gridDim.x + blockIdx.x;
+  const int q0 = query_start_loc[seq], qlen = query_start_loc[seq + 1] - q0, seq_len = seq_lens[seq];
+  int* bl = blist + ((int64_t)item * nkv + kvh) * (nbmax + 1);
+  if (row0 >= qlen * G) {  // empty item
+    for (int i = lane; i <= nbmax; i += 32) bl[i] = i < nbmax ? -1 : 0;
+    return;
+  }
+  const int last_row = min(row0 + 63, qlen * G - 1);
+  const int max_pos = seq_len - qlen + last_row / G;
+  const int nb = max_pos / SP_BLK + 1;
+  __shared__ float qm[HD], qa[HD], sc[SP_NBMAX];
+  const bool dense = tau >= 1.f || qlen < min_chunk || seq_len - qlen < min_ctx;
+  if (!dense) {
+    sparse_item_query(q8, qs, nqh, q0, row0, last_row - row0 + 1, G, kvh, lane, qm, qa);
+    __syncthreads();
+    const float* c = kc + (int64_t)(seq * nkv + kvh) * HD * nbmax;
+    const float* r = kr + (int64_t)(seq * nkv + kvh) * HD * nbmax;
+    for (int b = lane; b < nb; b += 32) {
+      float a0 = 0.f;
+      for (int d = 0; d < HD; ++d) a0 += qm[d] * c[(int64_t)d * nbmax + b] + qa[d] * r[(int64_t)d * nbmax + b];
+      sc[b] = a0;
+    }
+    __syncthreads();
+    float smax = -INFINITY;
+    for (int b = lane; b < nb; b += 32) smax = fmaxf(smax, sc[b]);
+    smax = wave_max(smax);
+    float z = 0.f;
+    for (int b = lane; b < nb; b += 32) { sc[b] = exp2f(sc[b] - smax); z += sc[b]; }
+    z = wave_sum_f(z);
+    float pmax = 0.f;
+    for (int b = lane; b < nb; b += 32) { sc[b] /= z; pmax = fmaxf(pmax, sc[b]); }
+    pmax = wave_max(pmax);
+    float lo = 0.f, hi = pmax;
+    for (int it = 0; it < 24; ++it) {
+      const float mid = 0.5f * (lo + hi);
+      float cov = 0.f;
+      for (int b = lane; b < nb; b += 32) {
+        const bool forced = b * SP_BLK < sink || b * SP_BLK + SP_BLK - 1 > max_pos - local;
+        if (forced || sc[b] >= mid) cov += sc[b];
+      }
+      if (wave_sum_f(cov) >= tau) lo = mid; else hi = mid;
+    }
+    int off = 0;
+    for (int base = 0; base < nb; base += 32) {
+      const int b = base + lane;
+      const bool forced = b * SP_BLK < sink || b * SP_BLK + SP_BLK - 1 > max_pos - local;
+      const bool keep = b < nb && (forced || sc[b] >= lo);
+      const uint32_t mask = __builtin_amdgcn_ballot_w32(keep);
+      if (keep) bl[off + __builtin_popcount(mask & ((1u << lane) - 1u))] = b;
+      off += __builtin_popcount(mask);
+    }
+    for (int i = off + lane; i < nbmax; i += 32) bl[i] = -1;
+    if (lane == 0) bl[nbmax] = off;
+  } else {
+    for (int i = lane; i < nbmax; i += 32) bl[i] = i < nb ? i : -1;
+    if (lane == 0) bl[nbmax] = nb;
   }
 }
 
@@ -1739,19 +1920,93 @@ void q_prep(torch::Tensor q, torch::Tensor q8, torch::Tensor qs, torch::Tensor q
                                                            qsum.data_ptr<int>(), sl2);
 }
 
+static float env_float(const char* name, float dflt) {
+  const char* v = std::getenv(name);
+  return v ? (float)std::atof(v) : dflt;
+}
+
+static torch::Tensor g_last_blist;  // debug: block list of the last sparse call (BONSAI_SPARSE_STATS=1)
+static torch::Tensor sparse_last_list() { return g_last_blist; }
+
+// Block lists of the opt-in block-sparse prefill: K box scan + selection. work != nullptr: one item per work entry
+// (prefill kernel); else `items` 64-row items per sequence of seq_ids (split-K chunk path). Returns
+// [items, nkv, nbmax + 1] (last entry = kept count). max_seq_len bounds the list width (no device sync).
+static torch::Tensor sparse_lists(torch::Tensor q8, torch::Tensor qs, torch::Tensor cache, torch::Tensor block_table,
+                                  torch::Tensor seq_lens, torch::Tensor query_start_loc, const torch::Tensor* work,
+                                  torch::Tensor seq_ids, int items, int64_t max_seq_len, float tau, int& nbmax_out) {
+  const int nqh = q8.size(1), nkv = cache.size(1), G = nqh / nkv, nseq = seq_lens.size(0);
+  const int64_t cap = max_seq_len > 0 ? max_seq_len : (int64_t)block_table.size(1) * cache.size(2);
+  const int nbmax = (int)((cap + SP_BLK - 1) / SP_BLK);
+  TORCH_CHECK(nbmax <= SP_NBMAX, "BONSAI_SPARSE_PREFILL: context too long (> ", SP_NBMAX * SP_BLK, ")");
+  const int sink = (int)env_float("BONSAI_SPARSE_SINK", 2048), local = (int)env_float("BONSAI_SPARSE_LOCAL", 4096);
+  const int min_ctx = (int)env_float("BONSAI_SPARSE_MIN_CTX", 16384);
+  const int min_chunk = (int)env_float("BONSAI_SPARSE_MIN_CHUNK", 128);
+  auto fopt = q8.options().dtype(at::kFloat);
+  auto kc = torch::empty({(int64_t)nseq * nkv * HD * nbmax}, fopt), kr = torch::empty_like(kc);
+  const int nitems = work ? (int)work->size(0) : items * (int)seq_ids.size(0);
+  auto blist = torch::empty({(int64_t)nitems * nkv * (nbmax + 1)}, q8.options().dtype(at::kInt));
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  dim3 kgrid(nbmax, nkv, nseq), grid(work ? nitems : items, nkv, work ? 1 : (int)seq_ids.size(0));
+  const int kbox_ctx = tau >= 1.f ? 0x7fffffff : min_ctx;  // tau = 1 keeps everything: no box scan
+ hipLaunchKernelGGL(( sparse_kbox_kernel), dim3(kgrid), dim3(32), 0, stream, cache.data_ptr<uint8_t>(), cache.stride(0), cache.stride(1),
+                                               cache.stride(2), cache.size(2), block_table.data_ptr<int>(),
+                                               block_table.stride(0), seq_lens.data_ptr<int>(),
+                                               query_start_loc.data_ptr<int>(), nkv, nbmax, kbox_ctx, min_chunk,
+                                               kc.data_ptr<float>(), kr.data_ptr<float>());
+ hipLaunchKernelGGL(( sparse_select_kernel), dim3(grid), dim3(32), 0, stream, 
+      q8.data_ptr<int8_t>(), qs.data_ptr<float>(), nqh, kc.data_ptr<float>(), kr.data_ptr<float>(),
+      seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), work ? work->data_ptr<int>() : nullptr,
+      work ? nullptr : seq_ids.data_ptr<int>(), G, nbmax, tau, sink, local, min_ctx, min_chunk,
+      blist.data_ptr<int>());
+  nbmax_out = nbmax;
+  if (std::getenv("BONSAI_SPARSE_STATS")) { g_last_blist = blist.view({nitems, nkv, nbmax + 1}); }
+  return blist;
+}
+
+// Opt-in block-sparse prefill (variant 0 only): score -> select -> sparse attention.
+template <typename TT>
+static void attn_prefill_sparse(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch::Tensor cache,
+                                torch::Tensor block_table, torch::Tensor seq_lens, torch::Tensor query_start_loc,
+                                torch::Tensor work, torch::Tensor out, int64_t max_seq_len, float tau) {
+  const int nwork = work.size(0), nqh = q8.size(1), nkv = cache.size(1), G = nqh / nkv;
+  int nbmax = 0;
+  auto blist = sparse_lists(q8, qs, cache, block_table, seq_lens, query_start_loc, &work, torch::Tensor(), 0,
+                            max_seq_len, tau, nbmax);
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  dim3 grid(nwork, nkv);
+ hipLaunchKernelGGL(( attn_prefill_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, 
+      q8.data_ptr<int8_t>(), qs.data_ptr<float>(), qsum.data_ptr<int>(), nqh, cache.data_ptr<uint8_t>(),
+      cache.stride(0), cache.stride(1), cache.stride(2), cache.size(2), block_table.data_ptr<int>(),
+      block_table.stride(0), seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), work.data_ptr<int>(), G,
+      (TT*)out.data_ptr(), out.stride(0), out.stride(1), blist.data_ptr<int>(), nbmax);
+}
+
+// max_seq_len > 0 (split-K chunk calls only) enables the opt-in block-sparse selection (BONSAI_SPARSE_PREFILL).
 void attn_decode(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch::Tensor cache, torch::Tensor block_table,
                  torch::Tensor seq_lens, torch::Tensor query_start_loc, torch::Tensor seq_ids, int64_t qtiles,
-                 int64_t num_splits, torch::Tensor part_o, torch::Tensor part_ml, torch::Tensor out) {
+                 int64_t num_splits, torch::Tensor part_o, torch::Tensor part_ml, torch::Tensor out,
+                 int64_t max_seq_len) {
   const int nseq = seq_ids.size(0);
   if (nseq == 0) return;
   const int nqh = q8.size(1), nkv = cache.size(1), G = nqh / nkv;
   auto stream = c10::hip::getCurrentHIPStream().stream();
   dim3 grid(nkv * qtiles, num_splits, nseq);
- hipLaunchKernelGGL(( attn_decode_kernel), dim3(grid), dim3(32), 0, stream, 
-      q8.data_ptr<int8_t>(), qs.data_ptr<float>(), qsum.data_ptr<int>(), nqh, cache.data_ptr<uint8_t>(),
-      cache.stride(0), cache.stride(1), cache.stride(2), cache.size(2), block_table.data_ptr<int>(),
-      block_table.stride(0), seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), seq_ids.data_ptr<int>(), G,
-      qtiles, part_o.data_ptr<float>(), part_ml.data_ptr<float>(), num_splits);
+  const float tau = max_seq_len > 0 ? env_float("BONSAI_SPARSE_PREFILL", 0.f) : 0.f;
+#define DEC_ARGS                                                                                                   \
+  q8.data_ptr<int8_t>(), qs.data_ptr<float>(), qsum.data_ptr<int>(), nqh, cache.data_ptr<uint8_t>(),               \
+      cache.stride(0), cache.stride(1), cache.stride(2), cache.size(2), block_table.data_ptr<int>(),               \
+      block_table.stride(0), seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), seq_ids.data_ptr<int>(),  \
+      G, qtiles, part_o.data_ptr<float>(), part_ml.data_ptr<float>(), num_splits
+  if (tau > 0.f && tau < 1.f) {  // tau = 1 keeps every block: the dense kernel is the exact result
+    int nbmax = 0;
+    const int items = (qtiles + 3) / 4;
+    auto blist = sparse_lists(q8, qs, cache, block_table, seq_lens, query_start_loc, nullptr, seq_ids, items,
+                              max_seq_len, tau, nbmax);
+   hipLaunchKernelGGL(( attn_decode_kernel<true>), dim3(grid), dim3(32), 0, stream, DEC_ARGS, blist.data_ptr<int>(), nbmax);
+  } else {
+   hipLaunchKernelGGL(( attn_decode_kernel<false>), dim3(grid), dim3(32), 0, stream, DEC_ARGS, nullptr, 0);
+  }
+#undef DEC_ARGS
   dim3 rgrid(nseq, nkv * qtiles * 16);
   if (out.scalar_type() == at::kHalf)
    hipLaunchKernelGGL(( attn_reduce_kernel<__half>), dim3(rgrid), dim3(32), 0, stream, part_o.data_ptr<float>(), part_ml.data_ptr<float>(), num_splits,
@@ -1766,12 +2021,25 @@ void attn_decode(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch::
 }
 
 void attn_prefill(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch::Tensor cache, torch::Tensor block_table,
-                  torch::Tensor seq_lens, torch::Tensor query_start_loc, torch::Tensor work, torch::Tensor out) {
+                  torch::Tensor seq_lens, torch::Tensor query_start_loc, torch::Tensor work, torch::Tensor out,
+                  int64_t max_seq_len) {
   const int nwork = work.size(0);
   if (nwork == 0) return;
   const int nqh = q8.size(1), nkv = cache.size(1), G = nqh / nkv;
   auto stream = c10::hip::getCurrentHIPStream().stream();
   dim3 grid(nwork, nkv);
+  const float tau = env_float("BONSAI_SPARSE_PREFILL", 0.f);  // read per call: tests toggle it in-process
+  if (tau > 0.f) {
+    TORCH_CHECK(std::getenv("BONSAI_PF_VARIANT") == nullptr || std::atoi(std::getenv("BONSAI_PF_VARIANT")) == 0,
+                "BONSAI_SPARSE_PREFILL needs BONSAI_PF_VARIANT=0");
+    if (out.scalar_type() == at::kHalf) {
+      attn_prefill_sparse<__half>(q8, qs, qsum, cache, block_table, seq_lens, query_start_loc, work, out, max_seq_len, tau);
+    } else {
+      attn_prefill_sparse<__hip_bfloat16>(q8, qs, qsum, cache, block_table, seq_lens, query_start_loc, work, out,
+                                          max_seq_len, tau);
+    }
+    return;
+  }
   const int variant = [] { const char* v = std::getenv("BONSAI_PF_VARIANT"); return v ? std::atoi(v) : 0; }();  // read per call: tests toggle it in-process
   // WG width of variant 1; the work items must hold 16 * pf_w rows (bonsai_int4_attn.PF_ROWS)
   const int pf_w = [] { const char* v = std::getenv("BONSAI_PF_W"); return v ? std::atoi(v) : 4; }();
@@ -1781,6 +2049,7 @@ void attn_prefill(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch:
       cache.stride(0), cache.stride(1), cache.stride(2), cache.size(2), block_table.data_ptr<int>(), \
       block_table.stride(0), seq_lens.data_ptr<int>(), query_start_loc.data_ptr<int>(), work.data_ptr<int>(), G, \
       (TT*)out.data_ptr(), out.stride(0), out.stride(1)
+#define PF_ARGS_SP(TT) PF_ARGS(TT), nullptr, 0
 #ifdef BONSAI_V3
 #define PF3_LAUNCH(TT) \
   if (pf_w == 8) {hipLaunchKernelGGL(( attn_prefill3_kernel<TT, 8>), dim3(grid), dim3(256), 0, stream, PF_ARGS(TT)); } \
@@ -1791,10 +2060,11 @@ void attn_prefill(torch::Tensor q8, torch::Tensor qs, torch::Tensor qsum, torch:
 #define LAUNCH(TT) \
   if (variant == 1) { PF3_LAUNCH(TT) } \
   else if (use_lds) {hipLaunchKernelGGL(( attn_prefill_lds_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); } \
-  else {hipLaunchKernelGGL(( attn_prefill_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS(TT)); }
+  else {hipLaunchKernelGGL(( attn_prefill_kernel<TT, 4>), dim3(grid), dim3(128), 0, stream, PF_ARGS_SP(TT)); }
   if (out.scalar_type() == at::kHalf) { LAUNCH(__half) } else { LAUNCH(__hip_bfloat16) }
 #undef LAUNCH
 #undef PF3_LAUNCH
+#undef PF_ARGS_SP
 #undef PF_ARGS
 }
 
@@ -1968,6 +2238,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("w8_dequant", &w8_dequant);
   m.def("kv_write", &kv_write);
   m.def("q_prep", &q_prep);
-  m.def("attn_decode", &attn_decode);
-  m.def("attn_prefill", &attn_prefill);
+  m.def("attn_decode", &attn_decode, py::arg("q8"), py::arg("qs"), py::arg("qsum"), py::arg("cache"),
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("query_start_loc"), py::arg("seq_ids"), py::arg("qtiles"),
+        py::arg("num_splits"), py::arg("part_o"), py::arg("part_ml"), py::arg("out"), py::arg("max_seq_len") = 0);
+  m.def("sparse_last_list", &sparse_last_list);
+  m.def("attn_prefill", &attn_prefill, py::arg("q8"), py::arg("qs"), py::arg("qsum"), py::arg("cache"),
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("query_start_loc"), py::arg("work"), py::arg("out"),
+        py::arg("max_seq_len") = 0);
 }

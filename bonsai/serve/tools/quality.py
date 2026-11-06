@@ -21,6 +21,9 @@ GREEDY_PROMPTS = (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CODE_COMMIT = "c4c1a88696"
 MAX_FILES = 400
+NLL_DEFAULT_TOKENS = 12000
+NLL_HEADROOM = 64
+ESTIMATE_MARGIN = 0.95
 
 
 def token_logprobs(prompt_logprobs):
@@ -86,7 +89,7 @@ def default_texts(args, headers):
     listing = git_out("ls-tree", "-r", "--name-only", CODE_COMMIT, "vllm/")
     blob = "".join(git_out("show", f"{CODE_COMMIT}:{p}")
                    for p in select_files(listing))
-    n = args.tokens * 4
+    n = (args.tokens or NLL_DEFAULT_TOKENS) * 4
     if len(blob) < 2 * n:
         raise SystemExit("not enough source text for --tokens")
     return [blob[:n], blob[n:2 * n]]
@@ -94,8 +97,7 @@ def default_texts(args, headers):
 
 def run_nll(args, headers):
     """Measure mean NLL per token over the code texts."""
-    texts = [Path(args.text_file).read_text()] if args.text_file \
-        else default_texts(args, headers)
+    texts = nll_texts(args, headers)
     lps = []
     for text in texts:
         reply = post_json(args.url + "/v1/completions", headers,
@@ -132,6 +134,56 @@ def fit_text(text, target, count):
     if count is None:
         count, target = max(1, len(text) // 4), int(target * 0.97)
     return text if count <= target else text[:len(text) * target // count]
+
+
+def server_tokens(args, headers, text):
+    """Return the /tokenize token ids of text, or None if unavailable."""
+    try:
+        reply = post_json(args.url + "/tokenize", headers,
+                          {"model": args.model, "prompt": text})
+        return list(reply["tokens"])
+    except (urllib.error.URLError, KeyError, ValueError, TypeError):
+        return None
+
+
+def server_detokenize(args, headers, tokens):
+    """Return the text of token ids via /detokenize, or None if unavailable."""
+    try:
+        reply = post_json(args.url + "/detokenize", headers,
+                          {"model": args.model, "tokens": tokens})
+        return str(reply["prompt"])
+    except (urllib.error.URLError, KeyError, ValueError, TypeError):
+        return None
+
+
+def chars_budget(target):
+    """Return the char count that chars/4 estimates as target minus the margin."""
+    return 4 * int(target * ESTIMATE_MARGIN)
+
+
+def trim_nll_text(args, headers, text, target):
+    """Trim text to at most target tokens, by server tokens or else chars/4."""
+    ids = server_tokens(args, headers, text)
+    if ids is None:
+        return text[:chars_budget(target)]
+    if len(ids) <= target:
+        return text
+    trimmed = server_detokenize(args, headers, ids[:target])
+    return text[:chars_budget(target)] if trimmed is None else trimmed
+
+
+def nll_budget(args):
+    """Return the prompt token budget: --tokens if given, capped to leave headroom."""
+    cap = args.max_context - NLL_HEADROOM
+    return cap if args.tokens is None else min(args.tokens, cap)
+
+
+def nll_texts(args, headers):
+    """Return the texts to score: the trimmed --text-file or two default texts."""
+    if not args.text_file:
+        return default_texts(args, headers)
+    text = Path(args.text_file).read_text()
+    return [trim_nll_text(args, headers, text, nll_budget(args))]
 
 
 def needle_request(args, headers, rng_seed):
@@ -207,7 +259,8 @@ def parse_args(argv=None):
     common.add_argument("--json", dest="json_path", default=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
     n = sub.add_parser("nll", parents=[common])
-    n.add_argument("--tokens", type=positive, default=12000)
+    n.add_argument("--tokens", type=positive, default=None)
+    n.add_argument("--max-context", type=positive, default=100000)
     n.add_argument("--text-file", default=None)
     d = sub.add_parser("needle", parents=[common])
     d.add_argument("--tokens", type=positive, default=97000)
