@@ -163,19 +163,47 @@ def print_table(results, depth):
         print(f"{'model ms/token':<28}{p['ms_per_token']:>10.4f}")
 
 
+def positive_int(text):
+    """argparse type: an integer >= 1."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
+def block_size(text):
+    """argparse type: a positive multiple of 16."""
+    value = positive_int(text)
+    if value % 16:
+        raise argparse.ArgumentTypeError(f"must be a positive multiple of 16, got {value}")
+    return value
+
+
+def _check_depth(p, a):
+    """Exit with a usage error when any T exceeds the KV depth."""
+    too_big = [t for t in a.tokens if t > a.depth]
+    if too_big:
+        p.error(f"--tokens {too_big} must be <= --depth {a.depth}")
+
+
 def parse_args(argv=None):
     """Parse the command line."""
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--tokens", type=int, nargs="+", default=[512, 2048], help="new tokens T")
-    p.add_argument("--depth", type=int, default=50000, help="KV depth D (incl. the T new tokens)")
-    p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK, help="KV page size")
-    p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--tokens", type=positive_int, nargs="+", default=[512, 2048],
+                   help="new tokens T")
+    p.add_argument("--depth", type=positive_int, default=50000,
+                   help="KV depth D (incl. the T new tokens)")
+    p.add_argument("--block-size", type=block_size, default=DEFAULT_BLOCK,
+                   help="KV page size (positive multiple of 16)")
+    p.add_argument("--iters", type=positive_int, default=20)
     p.add_argument("--gdn-k-heads", type=int, default=16)
     p.add_argument("--gdn-v-heads", type=int, default=48)
     p.add_argument("--gdn-k-dim", type=int, default=128)
     p.add_argument("--gdn-v-dim", type=int, default=128)
     p.add_argument("--json", metavar="PATH", help="write results as JSON")
-    return p.parse_args(argv)
+    a = p.parse_args(argv)
+    _check_depth(p, a)
+    return a
 
 
 def main(argv=None):

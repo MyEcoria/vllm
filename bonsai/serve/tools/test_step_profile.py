@@ -69,3 +69,20 @@ def test_gap_stats():
     k = lambda ts, d: {"cat": "kernel", "name": "k", "ts": ts, "dur": d}
     small, big = sp.gap_stats([k(0, 100), k(150, 100), k(1000, 10)])
     assert abs(small - 0.05) < 1e-9 and len(big) == 1
+
+
+def test_sparse_and_kv_kernels_are_attention():
+    """Sparse attention, q-prep and KV-write kernels are counted as attention, not other."""
+    for name in ("sparse_kbox_fwd", "sparse_select_kernel", "q_prep_fp16", "kv_write_k4"):
+        assert sp.categorize(name) == "attention int4"
+
+
+def test_zero_prefill_tokens_is_not_prefill():
+    """A step with 0 prefill tokens is not a prefill row (avoids division by zero)."""
+    name = "execute_context_1(0)_generation_3(3)"
+    assert sp.step_kind(name) == "decode"
+    ev = [{"cat": "user_annotation", "name": name, "ts": 0, "dur": 1000, "tid": 1},
+          {"cat": "cuda_runtime", "name": "hipLaunchKernel", "ts": 10, "args": {"correlation": 1}},
+          {"cat": "kernel", "name": "tern_m16", "ts": 100, "dur": 400, "args": {"correlation": 1}}]
+    assert sp.prefill_rows(ev) == []
+    assert "prefill" not in sp.analyse(ev)

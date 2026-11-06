@@ -8,7 +8,8 @@ from collections import defaultdict
 STEP_RE = re.compile(r"execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)")
 CATEGORIES = (
     ("ternary GEMM/GEMV", ("tern", "wmma_small", "gemv", "gemm", "cijk", "mmvq", "mmq")),
-    ("attention int4", ("int4", "attn", "attention", "splitk", "flash")),
+    ("attention int4", ("int4", "attn", "attention", "splitk", "flash",
+                        "sparse_kbox", "sparse_select", "q_prep", "kv_write")),
     ("GDN/recurrent", ("gdn", "conv1d", "recurrent", "kda", "ssm", "delta", "fla")),
     ("MTP head", ("mtp", "w8_m16", "w8_")),
     ("sampling", ("sampl", "topk", "top_k", "topp", "argmax", "softmax", "logit", "rejection")),
@@ -41,8 +42,10 @@ def step_kind(name):
     m = STEP_RE.search(name)
     if not m:
         return None
-    return "mixed" if int(m.group(1)) > 0 and int(m.group(2)) > 0 and int(m.group(3)) > 0 \
-        else ("decode" if int(m.group(1)) == 0 else "prefill")
+    ctx_reqs, tokens, gen_reqs = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if ctx_reqs == 0 or tokens == 0:
+        return "decode"
+    return "mixed" if gen_reqs > 0 else "prefill"
 
 
 def split_events(events):
@@ -230,7 +233,8 @@ def prefill_rows(events):
     groups = assign_kernels(steps, kernels, runtime)
     rows = []
     for i, s in enumerate(steps):
-        if step_kind(s["name"]) != "prefill" or not groups.get(i):
+        if step_kind(s["name"]) != "prefill" or not groups.get(i) \
+                or prefill_tokens(s["name"]) == 0:
             continue
         m, tokens = summarize_step(s, groups[i], runtime), prefill_tokens(s["name"])
         rows.append({"tokens": tokens, "wall_ms": m["cpu_ms"], "busy_ms": m["busy_ms"],

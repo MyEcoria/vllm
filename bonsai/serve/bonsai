@@ -30,7 +30,8 @@ Other options (all of them: bonsai launch --help):
     --decode-deadline-ms MS   cap the predicted time of each step at MS ms, so prefill never stalls decodes (default off)
     --kv-evict off|lag|kvzip  KV cache eviction, passed as BONSAI_KV_EVICT (default off); --kv-evict-ratio R (> 1, default 2)
                               goes to BONSAI_KV_EVICT_RATIO
-    --sparse-prefill TAU      opt-in, lossy: BONSAI_SPARSE_PREFILL, TAU in (0, 1] (default off). Measured at 0.9: solo 99k prefill
+    --sparse-prefill TAU      opt-in, lossy, needs --kv int4: BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] (default off).
+                              Measured at 0.9: solo 99k prefill
                               1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each (TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110;
                               needle 4/4. Applies to the 16 full-attention layers when the context before the chunk is >= 16384 tokens
     --sparse-min-chunk N      BONSAI_SPARSE_MIN_CHUNK, N >= 1 (default unset)
@@ -195,7 +196,7 @@ def api_key(a, data: Path, create: bool) -> str | None:
 
 
 PLAN_ENV = ("GPU_MAX_HW_QUEUES", "VLLM_GGUF_DRAFT_VOCAB_ON_CPU", "BONSAI_KV_EVICT", "BONSAI_KV_EVICT_RATIO",
-            "BONSAI_SPARSE_PREFILL", "BONSAI_SPARSE_MIN_CHUNK")
+            "BONSAI_SPARSE_PREFILL", "BONSAI_SPARSE_MIN_CHUNK", "BONSAI_PF_VARIANT", "BONSAI_PF_W")
 
 
 def parse_above_one(text: str) -> float:
@@ -215,10 +216,10 @@ def parse_positive_ms(text: str) -> float:
 
 
 def parse_tau(text: str) -> float:
-    """argparse type: a finite float greater than 0 and at most 1."""
+    """argparse type: a float from 0.001 to 1."""
     value = float(text)
-    if not 0 < value <= 1:
-        raise argparse.ArgumentTypeError(f"must be above 0 and at most 1, not {text!r}")
+    if not 0.001 <= value <= 1:
+        raise argparse.ArgumentTypeError(f"must be between 0.001 and 1, not {text!r}")
     return value
 
 
@@ -228,6 +229,30 @@ def parse_min_chunk(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, not {text!r}")
     return value
+
+
+def env_int(env: dict, name: str, default: int) -> int:
+    """An integer environment variable, or exit when it is not one."""
+    try:
+        return int(env.get(name, str(default)))
+    except ValueError:
+        die(f"{name} must be an integer, got {env[name]!r}")
+
+
+def check_prefill_env(a, env: dict) -> None:
+    """Fail fast on inherited BONSAI_PF_* values that the attention plugin would reject or ignore."""
+    variant = env_int(env, "BONSAI_PF_VARIANT", 0)
+    if variant not in (0, 1):
+        die(f"BONSAI_PF_VARIANT={variant} is not 0 or 1", "unset it or set 0 or 1")
+    if env_int(env, "BONSAI_PF_W", 4) not in (4, 8):
+        die(f"BONSAI_PF_W={env['BONSAI_PF_W']} is not 4 or 8", "unset it or set 4 or 8")
+    if variant == 1 and (a.kv != "int4" or env.get("BONSAI_KV_V3", "1") != "1"):
+        die("BONSAI_PF_VARIANT=1 is set, but the V3 int4 KV cache is not used", "unset BONSAI_PF_VARIANT or use --kv int4")
+    sparse = a.sparse_prefill is not None or bool(env.get("BONSAI_SPARSE_PREFILL"))
+    if variant == 1 and sparse:
+        die("sparse prefill needs BONSAI_PF_VARIANT=0", "unset BONSAI_PF_VARIANT")
+    if sparse and a.kv != "int4":
+        die("sparse prefill only works with the int4 KV cache", "use --kv int4 or unset BONSAI_SPARSE_PREFILL")
 
 
 def lan_addresses() -> list[str]:
@@ -395,6 +420,7 @@ def cmd_launch(a) -> int:
         say(key if key else "no API key (local host or --no-api-key)")
         return 0
     ctx = context_tokens(a)
+    check_prefill_env(a, server_env(a))
     pid = running_pid(data)
     if pid is not None and not a.plan:
         die(f"a bonsai server is already running (pid {pid})", "stop it with: bonsai launch --stop")
@@ -471,7 +497,8 @@ def main() -> int:
     l.add_argument("--kv-evict-ratio", type=parse_above_one, default=2.0, metavar="R",
                    help="KV eviction ratio, above 1, passed as BONSAI_KV_EVICT_RATIO (default 2; used only with --kv-evict)")
     l.add_argument("--sparse-prefill", type=parse_tau, default=None, metavar="TAU",
-                   help="opt-in, lossy: sparse prefill, passed as BONSAI_SPARSE_PREFILL, TAU in (0, 1] (default off). "
+                   help="opt-in, lossy, needs --kv int4: sparse prefill, passed as BONSAI_SPARSE_PREFILL, TAU in [0.001, 1] "
+                        "(default off). "
                         "Measured at 0.9: solo 99k prefill 1089 -> 1294 t/s; 4 x 99k shared 292 -> 332 t/s each "
                         "(TTFT 340 -> 298 s); long NLL 0.7073 -> 0.7110; needle 4/4. Applies to the 16 full-attention "
                         "layers when the context before the chunk is >= 16384 tokens")
@@ -490,6 +517,8 @@ def main() -> int:
     l.add_argument("--no-api-key", action="store_true", help="serve without an API key")
     l.add_argument("--data-dir", help=argparse.SUPPRESS)
     a = p.parse_args()
+    if a.sparse_prefill is not None and a.kv != "int4":
+        l.error("--sparse-prefill needs --kv int4")
     return cmd_launch(a)
 
 

@@ -24,18 +24,26 @@ def _nonneg_env(name, default):
     return value
 
 
+def _choice_env(name, default, allowed):
+    """Read an int env var at import time and reject values outside `allowed`."""
+    value = int(os.environ.get(name, str(default)))
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of {sorted(allowed)}, got {value}")
+    return value
+
+
 DEC_MAX = int(os.environ.get("BONSAI_INT4_DEC_MAX", "5"))
 # K 4-bit + V 3-bit (MSE-clipped): 232 B per (token, kv head) instead of 264
 V3 = os.environ.get("BONSAI_KV_V3", "1") == "1"
 CONTENT_BYTES = 232 if V3 else 264
 NUM_SPLITS = int(os.environ.get("BONSAI_INT4_SPLITS", "32"))
-PF_VARIANT = os.environ.get("BONSAI_PF_VARIANT", "0")
-PF_W = int(os.environ.get("BONSAI_PF_W", "4"))  # waves per prefill WG of variant 1 (4 or 8)
+PF_VARIANT = _choice_env("BONSAI_PF_VARIANT", 0, (0, 1))
+PF_W = _choice_env("BONSAI_PF_W", 4, (4, 8))  # waves per prefill WG of variant 1 (4 or 8)
 # Opt-in lossy block-sparse prefill (read by the kernel host code per call): BONSAI_SPARSE_PREFILL=tau (softmax
 # coverage, e.g. 0.95; unset = dense), BONSAI_SPARSE_SINK / _LOCAL (tokens always kept, 2048 / 4096),
 # BONSAI_SPARSE_MIN_CTX (context before the chunk from which it applies, 16384), BONSAI_SPARSE_MIN_CHUNK (shortest
 # chunk, 128; applies to the split-K chunk kernel too). Needs BONSAI_PF_VARIANT=0.
-PF_ROWS = 16 * (PF_W if PF_VARIANT == "1" else 4)  # rows per prefill work item (waves x 16)
+PF_ROWS = 16 * (PF_W if PF_VARIANT == 1 else 4)  # rows per prefill work item (waves x 16)
 SPLIT_CAP = int(os.environ.get("BONSAI_INT4_SPLIT_CAP", "1024"))
 PF_SPLITK_MAX = _nonneg_env("BONSAI_PF_SPLITK_MAX", 256)  # prefill chunks <= this use split-K (0 = never)
 OVERLAP = os.environ.get("BONSAI_ATTN_OVERLAP", "1") == "1"
